@@ -74,15 +74,15 @@ export function LoginScreen({
           <dl className="grid grid-cols-1 sm:grid-cols-3 gap-6 pt-4 border-t border-slate-200">
             <div>
               <dt className="text-xs font-medium text-slate-500">Szyfrowanie haseł</dt>
-              <dd className="mt-1 text-sm font-semibold text-slate-900 font-mono">AES-256-GCM</dd>
+              <dd className="mt-1 text-sm font-semibold text-slate-900 font-mono">Automatyczne AES-256-GCM</dd>
             </div>
             <div>
               <dt className="text-xs font-medium text-slate-500">Ochrona równoległości</dt>
               <dd className="mt-1 text-sm font-semibold text-slate-900">Transakcyjny lock 2 min</dd>
             </div>
             <div>
-              <dt className="text-xs font-medium text-slate-500">Blokada właściciela</dt>
-              <dd className="mt-1 text-sm font-semibold text-slate-900">Pierwsze konto Google</dd>
+              <dt className="text-xs font-medium text-slate-500">Przestrzeń użytkownika</dt>
+              <dd className="mt-1 text-sm font-semibold text-slate-900">Izolowane konto Google</dd>
             </div>
           </dl>
         </section>
@@ -95,8 +95,9 @@ export function LoginScreen({
                 <h2 className="text-lg font-semibold">Logowanie do panelu</h2>
               </div>
               <p className="text-sm text-slate-600">
-                Zaloguj się kontem Google. Pierwsze logowanie automatycznie przypisze Cię jako
-                właściciela instancji w Firestore.
+                Zaloguj się kontem Google. Aplikacja automatycznie utworzy Twoją prywatną
+                przestrzeń roboczą oraz wygeneruje klucze szyfrowania i token Cron — bez ręcznej
+                konfiguracji zmiennych środowiskowych.
               </p>
             </div>
 
@@ -119,7 +120,8 @@ export function LoginScreen({
             </button>
 
             <p className="text-xs text-slate-500 leading-relaxed">
-              Hasła skrzynek SMTP/IMAP oraz klucze API nigdy nie trafiają do przeglądarki ani logów.
+              Hasła skrzynek SMTP/IMAP oraz klucze szyfrowania nigdy nie trafiają do przeglądarki
+              ani logów.
             </p>
           </div>
         </section>

@@ -121,11 +121,21 @@ export interface ExecutionLock {
   expiresAtMs: number;
 }
 
+export interface RuntimeSecretsDoc {
+  ownerUid: string;
+  encryptionKey: string;
+  cronSecret: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface SecretsStatus {
   hasEncryptionKey: boolean;
   encryptionKeyValid: boolean;
   encryptionKeyError?: string;
+  encryptionKeySource?: 'env' | 'auto' | 'missing';
   hasCronSecret: boolean;
+  cronSecretSource?: 'env' | 'auto' | 'missing';
   hasGeminiKey: boolean;
 }
 
@@ -133,12 +143,16 @@ export interface SessionResponse {
   uid: string;
   email: string;
   isPrimaryOwner: boolean;
+  workspaceId: string;
+  isPersonalWorkspace: boolean;
   ownership: OwnershipDoc;
   secrets: SecretsStatus;
 }
 
 export interface DashboardPayload {
   ownership: OwnershipDoc;
+  workspaceId: string;
+  isPersonalWorkspace: boolean;
   settings: WarmupSettings;
   todayStats: DailyStats;
   computedSchedule: {
@@ -153,6 +167,7 @@ export interface DashboardPayload {
   recentLogs: WarmupLog[];
   activeLock: ExecutionLock | null;
   secrets: SecretsStatus;
+  cronToken?: string;
   appUrl: string;
 }
 

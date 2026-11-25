@@ -78,7 +78,9 @@ export function getSecretsStatus(env: NodeJS.ProcessEnv = process.env): SecretsS
     hasEncryptionKey: enc.present,
     encryptionKeyValid: enc.valid,
     encryptionKeyError: enc.error,
+    encryptionKeySource: enc.present ? 'env' : 'missing',
     hasCronSecret: cronSecret.length >= 16,
+    cronSecretSource: cronSecret.length >= 16 ? 'env' : 'missing',
     hasGeminiKey: Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY'),
   };
 }

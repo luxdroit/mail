@@ -7,6 +7,8 @@ import type {
   MailboxPublic,
   MessageFormat,
   OwnershipDoc,
+  RuntimeSecretsDoc,
+  SecretsStatus,
   SecurityMode,
   SessionResponse,
   WarmupSettings,
@@ -14,7 +16,6 @@ import type {
 import {
   createFirebaseTokenVerifier,
   extractBearerToken,
-  getSecretsStatus,
   verifyCronAuthorization,
   type TokenVerifier,
   type VerifiedUser,
@@ -24,6 +25,7 @@ import {
   EncryptionKeyError,
   encryptSecret,
   sanitizeForLogs,
+  validateEncryptionKeyStatus,
 } from './crypto';
 import { testGeminiConnection, type GenAiCaller } from './contentService';
 import {
@@ -39,8 +41,8 @@ import { executeWarmupCycle, LOCK_DOC_ID } from './warmupEngine';
 
 export interface ApiAppDependencies {
   verifyToken?: TokenVerifier;
-  createUserStore?: (idToken: string) => WarmupStore;
-  createCronStore?: () => Promise<WarmupStore | null>;
+  createUserStore?: (idToken: string, workspacePrefix?: string) => WarmupStore;
+  createCronStore?: (workspacePrefix?: string) => Promise<WarmupStore | null>;
   mailAdapter?: MailTransportAdapter;
   aiCaller?: GenAiCaller | null;
   getEnv?: () => NodeJS.ProcessEnv;
@@ -48,6 +50,7 @@ export interface ApiAppDependencies {
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const HOST_REGEX = /^[a-zA-Z0-9.-]{1,253}$/;
+const WORKSPACE_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
 const BLOCKED_HOSTS = new Set([
   'localhost',
   '127.0.0.1',
@@ -146,28 +149,201 @@ function buildAllowedEmails(ownership: OwnershipDoc): string[] {
   return Array.from(new Set([ownership.ownerEmail.toLowerCase(), ...ownership.coOwnerEmails.map((e) => e.toLowerCase())]));
 }
 
+interface ResolvedWorkspaceSecrets {
+  encryptionKey: string | undefined;
+  cronSecret: string | undefined;
+  cronTokenForUi: string | undefined;
+  status: SecretsStatus;
+}
+
+/**
+ * Ensures every workspace (both root and personal per-user workspaces) has auto-generated
+ * AES-256-GCM encryption key and Cron bearer token persisted in Firestore.
+ *
+ * - On the root workspace, valid server env vars (ENCRYPTION_KEY / CRON_SECRET) still take
+ *   precedence so existing deployments keep decrypting previously saved mailboxes seamlessly.
+ * - On personal workspaces (/users/{uid}/...), keys are ALWAYS isolated and auto-generated per user.
+ * - encryptionKey is NEVER returned to the browser; cronTokenForUi is returned only when auto-managed.
+ */
+async function ensureWorkspaceRuntimeSecrets(
+  store: WarmupStore,
+  ownerUid: string,
+  isPersonalWorkspace: boolean,
+  env: NodeJS.ProcessEnv
+): Promise<ResolvedWorkspaceSecrets> {
+  const geminiKey = (env.GEMINI_API_KEY ?? '').trim();
+  const hasGeminiKey = Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY');
+
+  let doc = await store.getRuntimeSecrets();
+  if (!doc) {
+    const nowIso = new Date().toISOString();
+    const candidate: RuntimeSecretsDoc = {
+      ownerUid,
+      encryptionKey: crypto.randomBytes(32).toString('hex'),
+      cronSecret: crypto.randomBytes(24).toString('hex'),
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    const res = await store.createRuntimeSecretsAtomic(candidate);
+    if (res.created) {
+      doc = candidate;
+    } else {
+      doc = await store.getRuntimeSecrets();
+    }
+  }
+
+  if (isPersonalWorkspace) {
+    const encryptionKey = doc?.encryptionKey;
+    const cronSecret = doc?.cronSecret;
+    return {
+      encryptionKey,
+      cronSecret,
+      cronTokenForUi: cronSecret,
+      status: {
+        hasEncryptionKey: Boolean(encryptionKey),
+        encryptionKeyValid: Boolean(encryptionKey),
+        encryptionKeySource: encryptionKey ? 'auto' : 'missing',
+        hasCronSecret: Boolean(cronSecret && cronSecret.length >= 16),
+        cronSecretSource: cronSecret && cronSecret.length >= 16 ? 'auto' : 'missing',
+        hasGeminiKey,
+      },
+    };
+  }
+
+  // Root workspace: honor explicit env overrides when present; otherwise auto-use stored keys
+  const envEnc = validateEncryptionKeyStatus(env.ENCRYPTION_KEY);
+  const envCron = (env.CRON_SECRET ?? '').trim();
+
+  let encryptionKey: string | undefined;
+  let encryptionKeySource: 'env' | 'auto' | 'missing' = 'missing';
+  let hasEncryptionKey = false;
+  let encryptionKeyValid = false;
+  let encryptionKeyError: string | undefined;
+
+  if (envEnc.present) {
+    hasEncryptionKey = true;
+    encryptionKeyValid = envEnc.valid;
+    encryptionKeyError = envEnc.error;
+    encryptionKeySource = 'env';
+    encryptionKey = envEnc.valid ? env.ENCRYPTION_KEY!.trim() : env.ENCRYPTION_KEY;
+  } else if (doc?.encryptionKey) {
+    hasEncryptionKey = true;
+    encryptionKeyValid = true;
+    encryptionKeySource = 'auto';
+    encryptionKey = doc.encryptionKey;
+  }
+
+  let cronSecret: string | undefined;
+  let cronTokenForUi: string | undefined;
+  let cronSecretSource: 'env' | 'auto' | 'missing' = 'missing';
+
+  if (envCron.length >= 16) {
+    cronSecret = envCron;
+    cronSecretSource = 'env';
+    // Do not expose server .env secret in browser responses
+    cronTokenForUi = undefined;
+  } else if (doc?.cronSecret && doc.cronSecret.length >= 16) {
+    cronSecret = doc.cronSecret;
+    cronTokenForUi = doc.cronSecret;
+    cronSecretSource = 'auto';
+  }
+
+  return {
+    encryptionKey,
+    cronSecret,
+    cronTokenForUi,
+    status: {
+      hasEncryptionKey,
+      encryptionKeyValid,
+      encryptionKeyError,
+      encryptionKeySource,
+      hasCronSecret: Boolean(cronSecret && cronSecret.length >= 16),
+      cronSecretSource,
+      hasGeminiKey,
+    },
+  };
+}
+
+interface WorkspaceContext {
+  user: VerifiedUser;
+  store: WarmupStore;
+  ownership: OwnershipDoc;
+  workspaceId: string;
+  isPersonalWorkspace: boolean;
+}
+
 export function createApiApp(deps: ApiAppDependencies = {}): Express {
   const app = express();
   app.set('trust proxy', true);
   app.use(express.json({ limit: '256kb' }));
 
   const verifyToken = deps.verifyToken ?? createFirebaseTokenVerifier();
-  const createUserStore = deps.createUserStore ?? ((idToken: string) => new FirestoreRestStore(idToken));
+  const createUserStore =
+    deps.createUserStore ??
+    ((idToken: string, workspacePrefix = '') => new FirestoreRestStore(idToken, undefined, workspacePrefix));
   const getEnv = deps.getEnv ?? (() => process.env);
   const createCronStore =
     deps.createCronStore ??
-    (async () => {
+    (async (workspacePrefix = '') => {
       const token = await resolveServerFirestoreAccessToken(getEnv());
       if (!token) return null;
-      return new FirestoreRestStore(token);
+      return new FirestoreRestStore(token, undefined, workspacePrefix);
     });
   const mailAdapter = deps.mailAdapter ?? new RealMailTransportAdapter();
 
-  async function authenticateOwner(
+  async function initPersonalWorkspace(
+    user: VerifiedUser,
+    idToken: string,
+    allowAutoProvision: boolean
+  ): Promise<WorkspaceContext | null> {
+    const personalPrefix = `users/${user.uid}`;
+    const personalStore = createUserStore(idToken, personalPrefix);
+    let ownership = await personalStore.getOwnership();
+
+    if (!ownership) {
+      if (!allowAutoProvision) {
+        return null;
+      }
+      const nowIso = new Date().toISOString();
+      const candidate: OwnershipDoc = {
+        ownerUid: user.uid,
+        ownerEmail: user.email,
+        coOwnerEmails: [],
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      const claimed = await personalStore.createOwnershipAtomic(candidate);
+      ownership = claimed.created ? candidate : await personalStore.getOwnership();
+      if (!ownership) return null;
+
+      if (claimed.created) {
+        const defaultSettings = createDefaultSettings(user.uid, [user.email]);
+        await personalStore.saveSettings(defaultSettings);
+        await personalStore.appendLog({
+          ownerUid: user.uid,
+          allowedEmails: [user.email],
+          level: 'info',
+          category: 'auth',
+          message: `Utworzono prywatną przestrzeń roboczą (${user.email}).`,
+          createdAt: nowIso,
+        });
+      }
+    }
+
+    return {
+      user,
+      store: personalStore,
+      ownership,
+      workspaceId: user.uid,
+      isPersonalWorkspace: true,
+    };
+  }
+
+  async function authenticateWorkspace(
     req: Request,
     res: Response,
     options: { allowInitialClaim?: boolean } = {}
-  ): Promise<{ user: VerifiedUser; store: WarmupStore; ownership: OwnershipDoc } | null> {
+  ): Promise<WorkspaceContext | null> {
     const idToken = extractBearerToken(req.headers.authorization);
     if (!idToken) {
       res.status(401).json({ error: 'Wymagane logowanie kontem Google.' });
@@ -182,14 +358,26 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
       return null;
     }
 
-    const store = createUserStore(idToken);
+    const rootStore = createUserStore(idToken, '');
 
     try {
-      let ownership = await store.getOwnership();
+      let rootOwnership: OwnershipDoc | null = null;
+      let rootDenied = false;
 
-      if (!ownership) {
+      try {
+        rootOwnership = await rootStore.getOwnership();
+      } catch (err) {
+        if (err instanceof FirestorePermissionError) {
+          // Another Google account already owns the root workspace — route cleanly to this user's isolated space
+          rootDenied = true;
+        } else {
+          throw err;
+        }
+      }
+
+      if (!rootDenied && !rootOwnership) {
         if (!options.allowInitialClaim) {
-          res.status(403).json({ error: 'Najpierw zainicjalizuj sesję właściciela.' });
+          res.status(403).json({ error: 'Najpierw zainicjalizuj sesję.' });
           return null;
         }
         const nowIso = new Date().toISOString();
@@ -200,40 +388,59 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
           createdAt: nowIso,
           updatedAt: nowIso,
         };
-        const claimed = await store.createOwnershipAtomic(candidate);
-        if (!claimed.created) {
-          res.status(403).json({
-            error: 'Dostęp odrzucony — ta aplikacja została już przypisana do innego właściciela Google.',
+        const claimed = await rootStore.createOwnershipAtomic(candidate);
+        if (claimed.created) {
+          const defaultSettings = createDefaultSettings(user.uid, [user.email]);
+          await rootStore.saveSettings(defaultSettings);
+          await rootStore.appendLog({
+            ownerUid: user.uid,
+            allowedEmails: [user.email],
+            level: 'info',
+            category: 'auth',
+            message: `Zarejestrowano głównego właściciela aplikacji (${user.email}).`,
+            createdAt: nowIso,
           });
-          return null;
+          return {
+            user,
+            store: rootStore,
+            ownership: candidate,
+            workspaceId: 'root',
+            isPersonalWorkspace: false,
+          };
         }
-        ownership = candidate;
-        const defaultSettings = createDefaultSettings(user.uid, [user.email]);
-        await store.saveSettings(defaultSettings);
-        await store.appendLog({
-          ownerUid: user.uid,
-          allowedEmails: [user.email],
-          level: 'info',
-          category: 'auth',
-          message: `Zarejestrowano właściciela aplikacji (${user.email}).`,
-          createdAt: nowIso,
-        });
+        // Lost initial claim race — fall through to isolated personal workspace
+        rootDenied = true;
       }
 
-      const isPrimary = ownership.ownerUid === user.uid;
-      const isCoOwner = ownership.coOwnerEmails.map((e) => e.toLowerCase()).includes(user.email.toLowerCase());
-      if (!isPrimary && !isCoOwner) {
+      if (!rootDenied && rootOwnership) {
+        const isPrimary = rootOwnership.ownerUid === user.uid;
+        const isCoOwner = rootOwnership.coOwnerEmails
+          .map((e) => e.toLowerCase())
+          .includes(user.email.toLowerCase());
+        if (isPrimary || isCoOwner) {
+          return {
+            user,
+            store: rootStore,
+            ownership: rootOwnership,
+            workspaceId: 'root',
+            isPersonalWorkspace: false,
+          };
+        }
+      }
+
+      // User is not the root owner or co-owner -> route to their strictly isolated personal workspace (/users/{uid}/...)
+      const personalCtx = await initPersonalWorkspace(user, idToken, Boolean(options.allowInitialClaim));
+      if (!personalCtx) {
         res.status(403).json({
-          error: 'Dostęp odrzucony — Twoje konto Google nie jest właścicielem ani współwłaścicielem tej aplikacji.',
+          error: 'Nie udało się zainicjalizować Twojej prywatnej przestrzeni roboczej. Zaloguj się ponownie.',
         });
         return null;
       }
-
-      return { user, store, ownership };
+      return personalCtx;
     } catch (err) {
       if (err instanceof FirestorePermissionError) {
         res.status(403).json({
-          error: 'Dostęp odrzucony — ta aplikacja należy już do innego konta Google.',
+          error: 'Brak uprawnień Firestore dla Twojego konta Google.',
         });
         return null;
       }
@@ -248,35 +455,55 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
     res.json({ ok: true, timestamp: new Date().toISOString() });
   });
 
-  // --- Session & First-Owner Claim ---
+  // --- Session & Automatic Workspace/Keys Bootstrap ---
   app.post('/api/auth/session', async (req, res) => {
-    const authCtx = await authenticateOwner(req, res, { allowInitialClaim: true });
+    const authCtx = await authenticateWorkspace(req, res, { allowInitialClaim: true });
     if (!authCtx) return;
 
-    const { user, ownership } = authCtx;
-    const payload: SessionResponse = {
-      uid: user.uid,
-      email: user.email,
-      isPrimaryOwner: ownership.ownerUid === user.uid,
-      ownership,
-      secrets: getSecretsStatus(getEnv()),
-    };
-    res.json(payload);
+    const { user, store, ownership, workspaceId, isPersonalWorkspace } = authCtx;
+    try {
+      const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
+        store,
+        ownership.ownerUid,
+        isPersonalWorkspace,
+        getEnv()
+      );
+      const payload: SessionResponse = {
+        uid: user.uid,
+        email: user.email,
+        isPrimaryOwner: ownership.ownerUid === user.uid,
+        workspaceId,
+        isPersonalWorkspace,
+        ownership,
+        secrets: resolvedSecrets.status,
+      };
+      res.json(payload);
+    } catch (err) {
+      res.status(500).json({ error: sanitizeForLogs(err instanceof Error ? err.message : String(err)) });
+    }
   });
 
   // --- Dashboard Snapshot ---
   app.get('/api/dashboard', async (req, res) => {
-    const authCtx = await authenticateOwner(req, res);
+    const authCtx = await authenticateWorkspace(req, res);
     if (!authCtx) return;
 
-    const { user, store, ownership } = authCtx;
+    const { user, store, ownership, workspaceId, isPersonalWorkspace } = authCtx;
     try {
+      const env = getEnv();
       const allowedEmails = buildAllowedEmails(ownership);
       let settings = await store.getSettings();
       if (!settings) {
         settings = createDefaultSettings(ownership.ownerUid, allowedEmails);
         await store.saveSettings(settings);
       }
+
+      const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
+        store,
+        ownership.ownerUid,
+        isPersonalWorkspace,
+        env
+      );
 
       const now = new Date();
       const zoned = getZonedParts(now, settings.timezone);
@@ -308,6 +535,8 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
 
       const payload: DashboardPayload = {
         ownership,
+        workspaceId,
+        isPersonalWorkspace,
         settings,
         todayStats,
         computedSchedule: {
@@ -321,8 +550,9 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
         mailboxes,
         recentLogs,
         activeLock: validLock,
-        secrets: getSecretsStatus(getEnv()),
-        appUrl: resolveAppUrl(req, getEnv()),
+        secrets: resolvedSecrets.status,
+        cronToken: resolvedSecrets.cronTokenForUi,
+        appUrl: resolveAppUrl(req, env),
       };
       res.json(payload);
     } catch (err) {
@@ -330,17 +560,59 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
     }
   });
 
-  // --- Update Settings & Co-Owners ---
-  app.put('/api/settings', async (req, res) => {
-    const authCtx = await authenticateOwner(req, res);
+  // --- Rotate Auto-Generated Cron Token ---
+  app.post('/api/cron/rotate-secret', async (req, res) => {
+    const authCtx = await authenticateWorkspace(req, res);
     if (!authCtx) return;
 
-    const { user, store, ownership } = authCtx;
+    const { store, ownership, isPersonalWorkspace } = authCtx;
+    const env = getEnv();
+
+    try {
+      const current = await ensureWorkspaceRuntimeSecrets(store, ownership.ownerUid, isPersonalWorkspace, env);
+      if (current.status.cronSecretSource === 'env') {
+        res.status(400).json({
+          error:
+            'CRON_SECRET jest obecnie nadpisany zmienną środowiskową serwera (.env). Usuń CRON_SECRET z .env, aby korzystać z automatycznej rotacji tokenu w panelu.',
+        });
+        return;
+      }
+
+      const newCronSecret = crypto.randomBytes(24).toString('hex');
+      const nowIso = new Date().toISOString();
+      await store.updateRuntimeSecretsCron(newCronSecret, nowIso);
+      await store.appendLog({
+        ownerUid: ownership.ownerUid,
+        allowedEmails: buildAllowedEmails(ownership),
+        level: 'info',
+        category: 'auth',
+        message: 'Wygenerowano nowy token autoryzacji Cron dla tej przestrzeni roboczej.',
+        createdAt: nowIso,
+      });
+
+      res.json({ cronToken: newCronSecret });
+    } catch (err) {
+      res.status(500).json({ error: sanitizeForLogs(err instanceof Error ? err.message : String(err)) });
+    }
+  });
+
+  // --- Update Settings & Co-Owners ---
+  app.put('/api/settings', async (req, res) => {
+    const authCtx = await authenticateWorkspace(req, res);
+    if (!authCtx) return;
+
+    const { user, store, ownership, isPersonalWorkspace } = authCtx;
     const body = (req.body ?? {}) as Record<string, unknown>;
 
     try {
       let currentOwnership = ownership;
       if (Array.isArray(body.coOwnerEmails)) {
+        if (isPersonalWorkspace) {
+          res.status(400).json({
+            error: 'Każde konto Google ma już własną prywatną przestrzeń roboczą — współwłaściciele dotyczą wyłącznie przestrzeni głównej.',
+          });
+          return;
+        }
         if (ownership.ownerUid !== user.uid) {
           res.status(403).json({ error: 'Tylko główny właściciel może zmieniać listę współwłaścicieli.' });
           return;
@@ -461,7 +733,7 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
 
   // --- Test Gemini AI ---
   app.post('/api/ai/test', async (req, res) => {
-    const authCtx = await authenticateOwner(req, res);
+    const authCtx = await authenticateWorkspace(req, res);
     if (!authCtx) return;
 
     const { store, ownership } = authCtx;
@@ -488,10 +760,10 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
 
   // --- Create / Upsert Mailbox ---
   app.post('/api/mailboxes', async (req, res) => {
-    const authCtx = await authenticateOwner(req, res);
+    const authCtx = await authenticateWorkspace(req, res);
     if (!authCtx) return;
 
-    const { store, ownership } = authCtx;
+    const { store, ownership, isPersonalWorkspace } = authCtx;
     const isPrimary = req.body?.role === 'primary';
     const existingPrimary = isPrimary ? await store.getMailbox('primary') : null;
     const validation = validateMailboxInput(req.body, !existingPrimary);
@@ -509,12 +781,18 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
         return;
       }
     }
-    const env = getEnv();
+
+    const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
+      store,
+      ownership.ownerUid,
+      isPersonalWorkspace,
+      getEnv()
+    );
     let encryptedPassword: string | undefined;
 
     if (input.password) {
       try {
-        encryptedPassword = encryptSecret(input.password, env.ENCRYPTION_KEY);
+        encryptedPassword = encryptSecret(input.password, resolvedSecrets.encryptionKey);
       } catch (err) {
         if (err instanceof EncryptionKeyError) {
           res.status(400).json({ error: err.message });
@@ -560,10 +838,10 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
 
   // --- Update Mailbox ---
   app.put('/api/mailboxes/:id', async (req, res) => {
-    const authCtx = await authenticateOwner(req, res);
+    const authCtx = await authenticateWorkspace(req, res);
     if (!authCtx) return;
 
-    const { store, ownership } = authCtx;
+    const { store, ownership, isPersonalWorkspace } = authCtx;
     const mailboxId = String(req.params.id ?? '');
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(mailboxId)) {
       res.status(400).json({ error: 'Nieprawidłowy identyfikator skrzynki.' });
@@ -576,7 +854,6 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
       return;
     }
 
-    // Allow partial active toggle or full update
     const mergedBody = {
       ...existing,
       ...(req.body ?? {}),
@@ -589,12 +866,17 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
     }
 
     const input = validation.data;
-    const env = getEnv();
+    const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
+      store,
+      ownership.ownerUid,
+      isPersonalWorkspace,
+      getEnv()
+    );
     let encryptedPassword: string | undefined;
 
     if (input.password) {
       try {
-        encryptedPassword = encryptSecret(input.password, env.ENCRYPTION_KEY);
+        encryptedPassword = encryptSecret(input.password, resolvedSecrets.encryptionKey);
       } catch (err) {
         if (err instanceof EncryptionKeyError) {
           res.status(400).json({ error: err.message });
@@ -631,7 +913,7 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
 
   // --- Delete Helper Mailbox ---
   app.delete('/api/mailboxes/:id', async (req, res) => {
-    const authCtx = await authenticateOwner(req, res);
+    const authCtx = await authenticateWorkspace(req, res);
     if (!authCtx) return;
 
     const { store } = authCtx;
@@ -651,10 +933,10 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
 
   // --- Test Mailbox SMTP/IMAP ---
   app.post('/api/mailboxes/:id/test', async (req, res) => {
-    const authCtx = await authenticateOwner(req, res);
+    const authCtx = await authenticateWorkspace(req, res);
     if (!authCtx) return;
 
-    const { store, ownership } = authCtx;
+    const { store, ownership, isPersonalWorkspace } = authCtx;
     const mailboxId = String(req.params.id ?? '');
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(mailboxId)) {
       res.status(400).json({ error: 'Nieprawidłowy identyfikator skrzynki.' });
@@ -673,9 +955,16 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
       return;
     }
 
+    const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
+      store,
+      ownership.ownerUid,
+      isPersonalWorkspace,
+      getEnv()
+    );
+
     let password: string;
     try {
-      password = decryptSecret(encrypted, getEnv().ENCRYPTION_KEY);
+      password = decryptSecret(encrypted, resolvedSecrets.encryptionKey);
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Błąd odszyfrowania hasła.' });
       return;
@@ -706,13 +995,19 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
 
   // --- Manual 1-Cycle Run ---
   app.post('/api/warmup/run-now', async (req, res) => {
-    const authCtx = await authenticateOwner(req, res);
+    const authCtx = await authenticateWorkspace(req, res);
     if (!authCtx) return;
 
-    const { user, store } = authCtx;
+    const { user, store, ownership, isPersonalWorkspace } = authCtx;
     const bypassWindowAndDelay = Boolean(req.body?.bypassWindowAndDelay);
 
     try {
+      const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
+        store,
+        ownership.ownerUid,
+        isPersonalWorkspace,
+        getEnv()
+      );
       const result = await executeWarmupCycle({
         store,
         mailAdapter,
@@ -720,7 +1015,7 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
         callerUid: user.uid,
         callerEmail: user.email,
         bypassWindowAndDelay,
-        encryptionKey: getEnv().ENCRYPTION_KEY,
+        encryptionKey: resolvedSecrets.encryptionKey,
         aiCaller: deps.aiCaller,
       });
 
@@ -731,23 +1026,40 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
     }
   });
 
-  // --- Stateless Cron Tick (cron-job.org) ---
+  // --- Stateless Cron Tick (cron-job.org, supports root and ?workspace=<uid>) ---
   app.post('/api/cron/tick', async (req, res) => {
     const env = getEnv();
-    const cronCheck = verifyCronAuthorization(
-      {
-        authorization: req.headers.authorization,
-        'x-cron-secret': req.headers['x-cron-secret'],
-      },
-      env.CRON_SECRET
-    );
+    const rawWorkspace =
+      (typeof req.query.workspace === 'string' ? req.query.workspace : undefined) ??
+      (typeof req.headers['x-workspace-id'] === 'string' ? req.headers['x-workspace-id'] : undefined) ??
+      '';
+    const workspaceParam = rawWorkspace.trim();
 
-    if (!cronCheck.ok) {
-      res.status(cronCheck.status).json({ error: cronCheck.error });
+    if (workspaceParam && workspaceParam !== 'root' && !WORKSPACE_ID_REGEX.test(workspaceParam)) {
+      res.status(400).json({ error: 'Nieprawidłowy identyfikator przestrzeni roboczej (?workspace=...).' });
       return;
     }
 
-    const store = await createCronStore();
+    const isPersonalWorkspace = Boolean(workspaceParam && workspaceParam !== 'root');
+    const workspacePrefix = isPersonalWorkspace ? `users/${workspaceParam}` : '';
+    const envCronSecret = (env.CRON_SECRET ?? '').trim();
+
+    // Fast fail on root workspace when server env CRON_SECRET is explicitly set
+    if (!isPersonalWorkspace && envCronSecret.length >= 16) {
+      const envCheck = verifyCronAuthorization(
+        {
+          authorization: req.headers.authorization,
+          'x-cron-secret': req.headers['x-cron-secret'],
+        },
+        envCronSecret
+      );
+      if (!envCheck.ok) {
+        res.status(envCheck.status).json({ error: envCheck.error });
+        return;
+      }
+    }
+
+    const store = await createCronStore(workspacePrefix);
     if (!store) {
       res.status(503).json({
         error:
@@ -757,15 +1069,47 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
     }
 
     try {
+      const runtimeSecrets = await store.getRuntimeSecrets();
+      const expectedCronSecret =
+        !isPersonalWorkspace && envCronSecret.length >= 16
+          ? envCronSecret
+          : (runtimeSecrets?.cronSecret ?? '').trim();
+
+      if (!expectedCronSecret) {
+        res.status(503).json({
+          error:
+            'Brak tokenu Cron dla tej przestrzeni roboczej — zaloguj się przynajmniej raz do panelu, aby wygenerować klucze automatycznie.',
+        });
+        return;
+      }
+
+      const cronCheck = verifyCronAuthorization(
+        {
+          authorization: req.headers.authorization,
+          'x-cron-secret': req.headers['x-cron-secret'],
+        },
+        expectedCronSecret
+      );
+      if (!cronCheck.ok) {
+        res.status(cronCheck.status).json({ error: cronCheck.error });
+        return;
+      }
+
+      const envEnc = validateEncryptionKeyStatus(env.ENCRYPTION_KEY);
+      const effectiveEncryptionKey =
+        !isPersonalWorkspace && envEnc.present
+          ? env.ENCRYPTION_KEY
+          : runtimeSecrets?.encryptionKey;
+
       const ownership = await store.getOwnership();
       const result = await executeWarmupCycle({
         store,
         mailAdapter,
         source: 'cron',
-        callerUid: ownership?.ownerUid ?? 'cron-system',
+        callerUid: ownership?.ownerUid ?? (isPersonalWorkspace ? workspaceParam : 'cron-system'),
         callerEmail: ownership?.ownerEmail ?? '',
         bypassWindowAndDelay: false,
-        encryptionKey: env.ENCRYPTION_KEY,
+        encryptionKey: effectiveEncryptionKey,
         aiCaller: deps.aiCaller,
       });
 
@@ -774,7 +1118,7 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
       if (err instanceof FirestorePermissionError) {
         res.status(503).json({
           error:
-            'Konto serwisowe nie ma uprawnień do Firestore (Starter Tier nie udostępnia IAM dla crona). Ulepsz projekt Firebase do standardowego projektu GCP i nadaj kontu serwisowemu Cloud Run rolę roles/datastore.user.',
+            'Konto serwisowe nie ma uprawnień do Firestore. Ustaw FIREBASE_SERVICE_ACCOUNT_JSON w pliku .env lub nadaj kontu serwisowemu Cloud Run rolę roles/datastore.user.',
         });
         return;
       }

@@ -208,6 +208,13 @@ export default function App({ authAdapter = firebaseAuthAdapter }: AppProps) {
     return res;
   };
 
+  const handleRotateCronSecret = async (): Promise<string> => {
+    const token = await getToken();
+    const res = await apiClient.rotateCronSecret(token);
+    if (user) await loadDashboard(user);
+    return res.cronToken;
+  };
+
   const handleRunCycleNow = async (bypassWindowAndDelay: boolean): Promise<WarmupCycleResult> => {
     setRunningCycle(true);
     setDashboardError(null);
@@ -319,7 +326,11 @@ export default function App({ authAdapter = firebaseAuthAdapter }: AppProps) {
           <div className="text-xs">
             <div className="font-medium text-slate-900 truncate">{session.email}</div>
             <div className="text-slate-500 mt-0.5">
-              {session.isPrimaryOwner ? 'Właściciel główny' : 'Współwłaściciel'}
+              {session.isPersonalWorkspace
+                ? 'Prywatna przestrzeń'
+                : session.isPrimaryOwner
+                  ? 'Właściciel główny'
+                  : 'Współwłaściciel'}
             </div>
           </div>
           <button
@@ -469,6 +480,7 @@ export default function App({ authAdapter = firebaseAuthAdapter }: AppProps) {
               settings={dashboard.settings}
               ownership={dashboard.ownership}
               isPrimaryOwner={session.isPrimaryOwner}
+              isPersonalWorkspace={dashboard.isPersonalWorkspace}
               secrets={dashboard.secrets}
               onSaveSettings={handleSaveSettings}
               onTestAi={handleTestAi}
@@ -478,8 +490,12 @@ export default function App({ authAdapter = firebaseAuthAdapter }: AppProps) {
           {activeSection === 'cron' && (
             <CronConfigView
               appUrl={dashboard.appUrl}
+              workspaceId={dashboard.workspaceId}
+              isPersonalWorkspace={dashboard.isPersonalWorkspace}
+              cronToken={dashboard.cronToken}
               secrets={dashboard.secrets}
               activeLock={dashboard.activeLock}
+              onRotateCronSecret={handleRotateCronSecret}
             />
           )}
         </main>

@@ -67,6 +67,10 @@ service cloud.firestore {
       );
     }
 
+    function isUserWorkspaceOwner(userId) {
+      return isVerified() && isValidId(userId) && request.auth.uid == userId;
+    }
+
     function matchesResourceAccess() {
       return isVerified() && (
         resource.data.ownerUid == request.auth.uid ||
@@ -80,6 +84,10 @@ service cloud.firestore {
       );
     }
 
+    function matchesPersonalResource(userId) {
+      return isUserWorkspaceOwner(userId) && resource.data.ownerUid == userId;
+    }
+
     // --- Validation Blueprints (Pillar 2: Anti-Update-Gap) ---
     function isValidOwnership(data) {
       return data.keys().hasAll(['ownerUid', 'ownerEmail', 'coOwnerEmails', 'createdAt', 'updatedAt'])
@@ -87,6 +95,21 @@ service cloud.firestore {
         && isValidId(data.ownerUid)
         && isValidEmail(data.ownerEmail)
         && isValidCoOwnerList(data.coOwnerEmails)
+        && isValidIsoDate(data.createdAt)
+        && isValidIsoDate(data.updatedAt);
+    }
+
+    function isValidRuntimeSecrets(data) {
+      return data.keys().hasAll(['ownerUid', 'encryptionKey', 'cronSecret', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'encryptionKey', 'cronSecret', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.encryptionKey is string
+        && data.encryptionKey.size() == 64
+        && data.encryptionKey.matches('^[0-9a-f]{64}$')
+        && data.cronSecret is string
+        && data.cronSecret.size() >= 32
+        && data.cronSecret.size() <= 128
+        && data.cronSecret.matches('^[a-zA-Z0-9_\\-]+$')
         && isValidIsoDate(data.createdAt)
         && isValidIsoDate(data.updatedAt);
     }
@@ -246,9 +269,11 @@ service cloud.firestore {
         && data.expiresAtMs is int && data.expiresAtMs >= data.acquiredAtMs;
     }
 
-    // --- Collection Rules ---
+    // =========================================================================
+    // PART A: Primary Root Workspace (original owner + optional co-owners)
+    // =========================================================================
 
-    // 1. Single-tenant ownership record
+    // 1. Primary ownership record
     match /system/ownership {
       allow list: if false;
       allow delete: if false;
@@ -267,7 +292,27 @@ service cloud.firestore {
         && incoming().diff(existing()).affectedKeys().hasOnly(['coOwnerEmails', 'updatedAt']);
     }
 
-    // 2. Warmup Settings singleton
+    // 2. Auto-generated runtime keys for root workspace (list & delete forbidden, encryptionKey immutable)
+    match /runtime_secrets/{secretId} {
+      allow list: if false;
+      allow delete: if false;
+      allow get: if isValidId(secretId) && isOwnerOrCoOwner();
+      allow create: if isVerified()
+        && isValidId(secretId)
+        && isValidRuntimeSecrets(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == ownershipData().ownerUid;
+      allow update: if isVerified()
+        && isValidId(secretId)
+        && isValidRuntimeSecrets(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().encryptionKey == existing().encryptionKey
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['cronSecret', 'updatedAt']);
+    }
+
+    // 3. Warmup Settings singleton
     match /settings/warmup {
       allow list: if false;
       allow delete: if false;
@@ -288,7 +333,7 @@ service cloud.firestore {
         ]);
     }
 
-    // 3. Mailboxes (no passwords stored here)
+    // 4. Mailboxes (no passwords stored here)
     match /mailboxes/{mailboxId} {
       allow list: if matchesResourceAccess();
       allow get: if isValidId(mailboxId) && isOwnerOrCoOwner();
@@ -313,7 +358,7 @@ service cloud.firestore {
       allow delete: if isValidId(mailboxId) && isOwnerOrCoOwner();
     }
 
-    // 4. Encrypted Mailbox Secrets (ciphertext only, list forbidden)
+    // 5. Encrypted Mailbox Secrets (ciphertext only, list forbidden)
     match /mailbox_secrets/{mailboxId} {
       allow list: if false;
       allow get: if isValidId(mailboxId) && isOwnerOrCoOwner();
@@ -331,7 +376,7 @@ service cloud.firestore {
       allow delete: if isValidId(mailboxId) && isOwnerOrCoOwner();
     }
 
-    // 5. Warmup Threads tracked by Message-ID
+    // 6. Warmup Threads tracked by Message-ID
     match /threads/{threadId} {
       allow list: if matchesResourceAccess();
       allow get: if isValidId(threadId) && isOwnerOrCoOwner();
@@ -354,7 +399,7 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // 6. Daily Stats
+    // 7. Daily Stats
     match /daily_stats/{dateKey} {
       allow list: if matchesResourceAccess();
       allow get: if isValidDateKey(dateKey) && isOwnerOrCoOwner();
@@ -378,7 +423,7 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // 7. Operational Logs (append-only)
+    // 8. Operational Logs (append-only)
     match /logs/{logId} {
       allow list: if matchesResourceAccess();
       allow get: if isValidId(logId) && isOwnerOrCoOwner();
@@ -391,7 +436,7 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // 8. Transactional Execution Locks
+    // 9. Atomic Execution Locks
     match /locks/{lockId} {
       allow list: if false;
       allow get: if isValidId(lockId) && isOwnerOrCoOwner();
@@ -409,6 +454,168 @@ service cloud.firestore {
           'lockedBy', 'source', 'acquiredAtMs', 'expiresAtMs'
         ]);
       allow delete: if isValidId(lockId) && isOwnerOrCoOwner();
+    }
+
+    // =========================================================================
+    // PART B: Isolated Per-User Personal Workspaces (/users/{userId}/...)
+    // Every additional verified Google user gets their own strictly isolated space
+    // =========================================================================
+
+    match /users/{userId}/system/ownership {
+      allow list: if false;
+      allow delete: if false;
+      allow get: if isUserWorkspaceOwner(userId);
+      allow create: if isUserWorkspaceOwner(userId)
+        && isValidOwnership(incoming())
+        && incoming().ownerUid == userId
+        && incoming().ownerEmail == request.auth.token.email;
+      allow update: if isUserWorkspaceOwner(userId)
+        && isValidOwnership(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().ownerEmail == existing().ownerEmail
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['coOwnerEmails', 'updatedAt']);
+    }
+
+    match /users/{userId}/runtime_secrets/{secretId} {
+      allow list: if false;
+      allow delete: if false;
+      allow get: if isUserWorkspaceOwner(userId) && isValidId(secretId);
+      allow create: if isUserWorkspaceOwner(userId)
+        && isValidId(secretId)
+        && isValidRuntimeSecrets(incoming())
+        && incoming().ownerUid == userId;
+      allow update: if isUserWorkspaceOwner(userId)
+        && isValidId(secretId)
+        && isValidRuntimeSecrets(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().encryptionKey == existing().encryptionKey
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['cronSecret', 'updatedAt']);
+    }
+
+    match /users/{userId}/settings/warmup {
+      allow list: if false;
+      allow delete: if false;
+      allow get: if isUserWorkspaceOwner(userId);
+      allow create: if isUserWorkspaceOwner(userId)
+        && isValidWarmupSettings(incoming())
+        && incoming().ownerUid == userId;
+      allow update: if isUserWorkspaceOwner(userId)
+        && isValidWarmupSettings(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'allowedEmails', 'enabled', 'startDateKey', 'startDailyCount',
+          'dailyIncrement', 'maxDailyCap', 'minDelayMinutes', 'maxDelayMinutes',
+          'windowStartHour', 'windowEndHour', 'timezone', 'messageFormat',
+          'aiModel', 'lastSentAt', 'nextAllowedSendAt', 'lastHelperIndex', 'updatedAt'
+        ]);
+    }
+
+    match /users/{userId}/mailboxes/{mailboxId} {
+      allow list: if matchesPersonalResource(userId);
+      allow get: if isUserWorkspaceOwner(userId) && isValidId(mailboxId);
+      allow create: if isUserWorkspaceOwner(userId)
+        && isValidId(mailboxId)
+        && isValidMailbox(incoming())
+        && incoming().ownerUid == userId;
+      allow update: if isUserWorkspaceOwner(userId)
+        && isValidId(mailboxId)
+        && isValidMailbox(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'allowedEmails', 'role', 'label', 'email',
+          'smtpHost', 'smtpPort', 'smtpSecurity',
+          'imapHost', 'imapPort', 'imapSecurity',
+          'active', 'hasPassword', 'lastTestedAt', 'lastTestStatus',
+          'lastTestMessage', 'lastCheckedAt', 'updatedAt'
+        ]);
+      allow delete: if isUserWorkspaceOwner(userId) && isValidId(mailboxId);
+    }
+
+    match /users/{userId}/mailbox_secrets/{mailboxId} {
+      allow list: if false;
+      allow get: if isUserWorkspaceOwner(userId) && isValidId(mailboxId);
+      allow create: if isUserWorkspaceOwner(userId)
+        && isValidId(mailboxId)
+        && isValidMailboxSecret(incoming())
+        && incoming().ownerUid == userId;
+      allow update: if isUserWorkspaceOwner(userId)
+        && isValidId(mailboxId)
+        && isValidMailboxSecret(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().diff(existing()).affectedKeys().hasOnly(['encryptedPassword', 'updatedAt']);
+      allow delete: if isUserWorkspaceOwner(userId) && isValidId(mailboxId);
+    }
+
+    match /users/{userId}/threads/{threadId} {
+      allow list: if matchesPersonalResource(userId);
+      allow get: if isUserWorkspaceOwner(userId) && isValidId(threadId);
+      allow create: if isUserWorkspaceOwner(userId)
+        && isValidId(threadId)
+        && isValidThread(incoming())
+        && incoming().ownerUid == userId;
+      allow update: if isUserWorkspaceOwner(userId)
+        && isValidId(threadId)
+        && isValidThread(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().messageId == existing().messageId
+        && incoming().sentAt == existing().sentAt
+        && existing().status != 'replied'
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'allowedEmails', 'status', 'foundInSpam', 'repliedAt', 'replyMessageId'
+        ]);
+      allow delete: if false;
+    }
+
+    match /users/{userId}/daily_stats/{dateKey} {
+      allow list: if matchesPersonalResource(userId);
+      allow get: if isUserWorkspaceOwner(userId) && isValidDateKey(dateKey);
+      allow create: if isUserWorkspaceOwner(userId)
+        && isValidDateKey(dateKey)
+        && isValidDailyStats(incoming())
+        && incoming().ownerUid == userId
+        && incoming().dateKey == dateKey;
+      allow update: if isUserWorkspaceOwner(userId)
+        && isValidDateKey(dateKey)
+        && isValidDailyStats(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().dateKey == existing().dateKey
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'allowedEmails', 'dayIndex', 'targetLimit', 'sentCount',
+          'repliedCount', 'rescuedFromSpamCount', 'fallbackCount',
+          'errorCount', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    match /users/{userId}/logs/{logId} {
+      allow list: if matchesPersonalResource(userId);
+      allow get: if isUserWorkspaceOwner(userId) && isValidId(logId);
+      allow create: if isUserWorkspaceOwner(userId)
+        && isValidId(logId)
+        && isValidLog(incoming())
+        && incoming().ownerUid == userId;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /users/{userId}/locks/{lockId} {
+      allow list: if false;
+      allow get: if isUserWorkspaceOwner(userId) && isValidId(lockId);
+      allow create: if isUserWorkspaceOwner(userId)
+        && isValidId(lockId)
+        && isValidLock(incoming())
+        && incoming().ownerUid == userId;
+      allow update: if isUserWorkspaceOwner(userId)
+        && isValidId(lockId)
+        && isValidLock(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'lockedBy', 'source', 'acquiredAtMs', 'expiresAtMs'
+        ]);
+      allow delete: if isUserWorkspaceOwner(userId) && isValidId(lockId);
     }
   }
 }

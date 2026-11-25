@@ -276,3 +276,58 @@ describe('Standalone Firebase config and Service Account OAuth2 token resolution
     }
   });
 });
+
+describe('FirestoreRestStore personal workspace prefix and runtime_secrets paths', () => {
+  it('routes subcollection documents under /users/{uid}/... while keeping :commit on /documents:commit', async () => {
+    const calls: MockFetchCall[] = [];
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      calls.push({ url, method, body: typeof init?.body === 'string' ? init.body : undefined });
+      return new Response(JSON.stringify({}), { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const store = new FirestoreRestStore(
+        'user-id-token',
+        { projectId: 'test-proj', firestoreDatabaseId: 'test-db' },
+        'users/user_abc123'
+      );
+
+      await store.createOwnershipAtomic({
+        ownerUid: 'user_abc123',
+        ownerEmail: 'user@example.com',
+        coOwnerEmails: [],
+        createdAt: '2026-11-25T10:00:00.000Z',
+        updatedAt: '2026-11-25T10:00:00.000Z',
+      });
+
+      await store.createRuntimeSecretsAtomic({
+        ownerUid: 'user_abc123',
+        encryptionKey: 'a'.repeat(64),
+        cronSecret: 'b'.repeat(48),
+        createdAt: '2026-11-25T10:00:00.000Z',
+        updatedAt: '2026-11-25T10:00:00.000Z',
+      });
+
+      assert.equal(
+        calls[0].url,
+        'https://firestore.googleapis.com/v1/projects/test-proj/databases/test-db/documents:commit'
+      );
+      assert.ok(
+        calls[0].body?.includes(
+          'projects/test-proj/databases/test-db/documents/users/user_abc123/system/ownership'
+        )
+      );
+      assert.equal(
+        calls[1].url,
+        'https://firestore.googleapis.com/v1/projects/test-proj/databases/test-db/documents/users/user_abc123/runtime_secrets/keys?currentDocument.exists=false'
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+

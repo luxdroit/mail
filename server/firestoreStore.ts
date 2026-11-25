@@ -6,6 +6,7 @@ import type {
   ExecutionLock,
   MailboxPublic,
   OwnershipDoc,
+  RuntimeSecretsDoc,
   WarmupLog,
   WarmupSettings,
   WarmupThread,
@@ -31,6 +32,10 @@ export interface WarmupStore {
   getOwnership(): Promise<OwnershipDoc | null>;
   createOwnershipAtomic(doc: OwnershipDoc): Promise<{ created: boolean }>;
   updateOwnershipCoOwners(coOwnerEmails: string[], updatedAt: string): Promise<void>;
+
+  getRuntimeSecrets(): Promise<RuntimeSecretsDoc | null>;
+  createRuntimeSecretsAtomic(doc: RuntimeSecretsDoc): Promise<{ created: boolean }>;
+  updateRuntimeSecretsCron(cronSecret: string, updatedAt: string): Promise<RuntimeSecretsDoc>;
 
   getSettings(): Promise<WarmupSettings | null>;
   saveSettings(settings: WarmupSettings): Promise<void>;
@@ -363,24 +368,39 @@ export async function resolveServerFirestoreAccessToken(
   return fetchMetadataAccessToken();
 }
 
+const WORKSPACE_PREFIX_REGEX = /^$|^users\/[a-zA-Z0-9_-]{1,128}$/;
+
 export class FirestoreRestStore implements WarmupStore {
   private readonly projectId: string;
   private readonly databaseId: string;
   private readonly bearerToken: string;
+  private readonly workspacePrefix: string;
 
-  constructor(bearerToken: string, config?: FirebaseAppletConfig) {
+  constructor(bearerToken: string, config?: FirebaseAppletConfig, workspacePrefix = '') {
+    if (!WORKSPACE_PREFIX_REGEX.test(workspacePrefix)) {
+      throw new Error('Nieprawidłowy prefiks przestrzeni roboczej Firestore.');
+    }
     const cfg = config ?? loadFirebaseAppletConfig();
     this.projectId = cfg.projectId;
     this.databaseId = cfg.firestoreDatabaseId || '(default)';
     this.bearerToken = bearerToken;
+    this.workspacePrefix = workspacePrefix;
+  }
+
+  private get documentsRoot(): string {
+    return `projects/${this.projectId}/databases/${this.databaseId}/documents`;
   }
 
   private get dbRoot(): string {
-    return `projects/${this.projectId}/databases/${this.databaseId}/documents`;
+    return this.workspacePrefix ? `${this.documentsRoot}/${this.workspacePrefix}` : this.documentsRoot;
   }
 
   private get baseUrl(): string {
     return `https://firestore.googleapis.com/v1/${this.dbRoot}`;
+  }
+
+  private get commitUrl(): string {
+    return `https://firestore.googleapis.com/v1/${this.documentsRoot}:commit`;
   }
 
   private docName(docPath: string): string {
@@ -510,7 +530,7 @@ export class FirestoreRestStore implements WarmupStore {
   }
 
   async createOwnershipAtomic(ownership: OwnershipDoc): Promise<{ created: boolean }> {
-    const resp = await fetch(`${this.baseUrl}:commit`, {
+    const resp = await fetch(this.commitUrl, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.bearerToken}`,
@@ -551,6 +571,53 @@ export class FirestoreRestStore implements WarmupStore {
       },
       true
     );
+  }
+
+  async getRuntimeSecrets(): Promise<RuntimeSecretsDoc | null> {
+    const doc = await this.getDoc<RuntimeSecretsDoc>('runtime_secrets/keys');
+    if (!doc) return null;
+    const { __docId: _, ...rest } = doc;
+    return rest;
+  }
+
+  async createRuntimeSecretsAtomic(doc: RuntimeSecretsDoc): Promise<{ created: boolean }> {
+    const resp = await fetch(`${this.baseUrl}/runtime_secrets/keys?currentDocument.exists=false`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${this.bearerToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        fields: encodeFields(doc as unknown as Record<string, unknown>),
+      }),
+    });
+
+    if (resp.status === 409 || resp.status === 400) {
+      return { created: false };
+    }
+    if (resp.status === 403 || resp.status === 401) {
+      const txt = await resp.text();
+      throw new FirestorePermissionError(resp.status, txt || 'Brak uprawnień do zapisu kluczy przestrzeni roboczej.');
+    }
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error(`Runtime secrets create failed: HTTP ${resp.status} ${txt.slice(0, 200)}`);
+    }
+    return { created: true };
+  }
+
+  async updateRuntimeSecretsCron(cronSecret: string, updatedAt: string): Promise<RuntimeSecretsDoc> {
+    const current = await this.getRuntimeSecrets();
+    if (!current) {
+      throw new Error('Brak wygenerowanych kluczy przestrzeni roboczej.');
+    }
+    const updated: RuntimeSecretsDoc = {
+      ...current,
+      cronSecret,
+      updatedAt,
+    };
+    await this.putDoc('runtime_secrets/keys', updated as unknown as Record<string, unknown>, true);
+    return updated;
   }
 
   async getSettings(): Promise<WarmupSettings | null> {
@@ -797,6 +864,7 @@ export class FirestoreRestStore implements WarmupStore {
  */
 export class InMemoryWarmupStore implements WarmupStore {
   ownership: OwnershipDoc | null = null;
+  runtimeSecrets: RuntimeSecretsDoc | null = null;
   settings: WarmupSettings | null = null;
   mailboxes = new Map<string, MailboxPublic>();
   secrets = new Map<string, string>();
@@ -818,6 +886,22 @@ export class InMemoryWarmupStore implements WarmupStore {
   async updateOwnershipCoOwners(coOwnerEmails: string[], updatedAt: string): Promise<void> {
     if (!this.ownership) throw new Error('Brak właściciela.');
     this.ownership = { ...this.ownership, coOwnerEmails: [...coOwnerEmails], updatedAt };
+  }
+
+  async getRuntimeSecrets(): Promise<RuntimeSecretsDoc | null> {
+    return this.runtimeSecrets ? { ...this.runtimeSecrets } : null;
+  }
+
+  async createRuntimeSecretsAtomic(doc: RuntimeSecretsDoc): Promise<{ created: boolean }> {
+    if (this.runtimeSecrets) return { created: false };
+    this.runtimeSecrets = { ...doc };
+    return { created: true };
+  }
+
+  async updateRuntimeSecretsCron(cronSecret: string, updatedAt: string): Promise<RuntimeSecretsDoc> {
+    if (!this.runtimeSecrets) throw new Error('Brak wygenerowanych kluczy przestrzeni roboczej.');
+    this.runtimeSecrets = { ...this.runtimeSecrets, cronSecret, updatedAt };
+    return { ...this.runtimeSecrets };
   }
 
   async getSettings(): Promise<WarmupSettings | null> {

@@ -220,8 +220,17 @@ test('concurrent double execution is blocked by transactional lock (2-min TTL) a
   assert.equal((await store.getLock(LOCK_DOC_ID))?.lockedBy, 'run-B');
 });
 
-test('API routes enforce owner lock, cron secret protection, and zero password leakage', async () => {
-  const store = new InMemoryWarmupStore();
+test('API routes enforce workspace isolation, env secret overrides, and zero password leakage', async () => {
+  const stores = new Map<string, InMemoryWarmupStore>();
+  const getStore = (prefix = '') => {
+    let s = stores.get(prefix);
+    if (!s) {
+      s = new InMemoryWarmupStore();
+      stores.set(prefix, s);
+    }
+    return s;
+  };
+
   let currentEnv: NodeJS.ProcessEnv = {
     ENCRYPTION_KEY: TEST_ENC_KEY,
     CRON_SECRET: TEST_CRON_SECRET,
@@ -229,7 +238,7 @@ test('API routes enforce owner lock, cron secret protection, and zero password l
 
   const tokenMap: Record<string, { uid: string; email: string }> = {
     'token-owner': { uid: 'uid-owner', email: 'owner@example.com' },
-    'token-intruder': { uid: 'uid-intruder', email: 'stranger@example.com' },
+    'token-second-user': { uid: 'uid-second', email: 'second@example.com' },
     'token-coowner': { uid: 'uid-coowner', email: 'partner@example.com' },
   };
 
@@ -239,8 +248,8 @@ test('API routes enforce owner lock, cron secret protection, and zero password l
       if (!entry) throw new Error('Invalid token');
       return { ...entry, emailVerified: true, idToken };
     },
-    createUserStore: () => store,
-    createCronStore: async () => store,
+    createUserStore: (_token, workspacePrefix = '') => getStore(workspacePrefix),
+    createCronStore: async (workspacePrefix = '') => getStore(workspacePrefix),
     mailAdapter: createMockMailAdapter({ simulateNoSpamFolder: true }),
     aiCaller: null,
     getEnv: () => currentEnv,
@@ -251,24 +260,43 @@ test('API routes enforce owner lock, cron secret protection, and zero password l
   const baseUrl = `http://127.0.0.1:${port}`;
 
   try {
-    // 1. First Google account claims ownership
+    // 1. First Google account claims root ownership
     const r1 = await fetch(`${baseUrl}/api/auth/session`, {
       method: 'POST',
       headers: { Authorization: 'Bearer token-owner' },
     });
     assert.equal(r1.status, 200);
-    const s1 = (await r1.json()) as { isPrimaryOwner: boolean; ownership: { ownerUid: string } };
+    const s1 = (await r1.json()) as {
+      isPrimaryOwner: boolean;
+      isPersonalWorkspace: boolean;
+      workspaceId: string;
+      ownership: { ownerUid: string };
+    };
     assert.equal(s1.isPrimaryOwner, true);
+    assert.equal(s1.isPersonalWorkspace, false);
+    assert.equal(s1.workspaceId, 'root');
     assert.equal(s1.ownership.ownerUid, 'uid-owner');
 
-    // 2. Different Google account is rejected with 403
-    const rIntruder = await fetch(`${baseUrl}/api/auth/session`, {
+    // 2. Different Google account automatically gets their own isolated personal workspace (no 403 wall)
+    const rSecond = await fetch(`${baseUrl}/api/auth/session`, {
       method: 'POST',
-      headers: { Authorization: 'Bearer token-intruder' },
+      headers: { Authorization: 'Bearer token-second-user' },
     });
-    assert.equal(rIntruder.status, 403);
+    assert.equal(rSecond.status, 200);
+    const s2 = (await rSecond.json()) as {
+      isPrimaryOwner: boolean;
+      isPersonalWorkspace: boolean;
+      workspaceId: string;
+      ownership: { ownerUid: string };
+      secrets: { encryptionKeySource: string; cronSecretSource: string };
+    };
+    assert.equal(s2.isPersonalWorkspace, true);
+    assert.equal(s2.workspaceId, 'uid-second');
+    assert.equal(s2.ownership.ownerUid, 'uid-second');
+    assert.equal(s2.secrets.encryptionKeySource, 'auto');
+    assert.equal(s2.secrets.cronSecretSource, 'auto');
 
-    // 3. Owner adds co-owner email -> co-owner can now access
+    // 3. Owner adds co-owner email -> co-owner joins root workspace
     const rSettings = await fetch(`${baseUrl}/api/settings`, {
       method: 'PUT',
       headers: {
@@ -284,8 +312,11 @@ test('API routes enforce owner lock, cron secret protection, and zero password l
       headers: { Authorization: 'Bearer token-coowner' },
     });
     assert.equal(rCoOwner.status, 200);
+    const sCo = (await rCoOwner.json()) as { isPersonalWorkspace: boolean; workspaceId: string };
+    assert.equal(sCo.isPersonalWorkspace, false);
+    assert.equal(sCo.workspaceId, 'root');
 
-    // 4. Create mailbox with secret password -> password never appears in API JSON or logs
+    // 4. Create mailbox with secret password -> password never appears in API JSON or logs, and second user cannot see it
     const secretPass = 'UltraSensitiveMailboxPass!777';
     const rMb = await fetch(`${baseUrl}/api/mailboxes`, {
       method: 'POST',
@@ -319,7 +350,22 @@ test('API routes enforce owner lock, cron secret protection, and zero password l
     const dashText = await rDash.text();
     assert.equal(dashText.includes(secretPass), false);
     assert.equal(dashText.includes(TEST_ENC_KEY), false);
+    // Env-configured CRON_SECRET is never returned to browser
     assert.equal(dashText.includes(TEST_CRON_SECRET), false);
+
+    // Second user dashboard must NOT contain owner's mailbox or encryption key
+    const rDashSecond = await fetch(`${baseUrl}/api/dashboard`, {
+      headers: { Authorization: 'Bearer token-second-user' },
+    });
+    assert.equal(rDashSecond.status, 200);
+    const dashSecond = (await rDashSecond.json()) as {
+      mailboxes: MailboxPublic[];
+      cronToken?: string;
+      workspaceId: string;
+    };
+    assert.equal(dashSecond.mailboxes.length, 0);
+    assert.equal(dashSecond.workspaceId, 'uid-second');
+    assert.ok(dashSecond.cronToken && dashSecond.cronToken.length >= 32);
 
     // 5. Cron endpoint rejects missing/wrong secret with 401
     const rCronUnauth = await fetch(`${baseUrl}/api/cron/tick`, { method: 'POST' });
@@ -331,7 +377,7 @@ test('API routes enforce owner lock, cron secret protection, and zero password l
     });
     assert.equal(rCronWrong.status, 401);
 
-    // 6. Cron endpoint accepts Bearer and x-cron-secret
+    // 6. Cron endpoint accepts Bearer and x-cron-secret on root workspace
     const rCronOk = await fetch(`${baseUrl}/api/cron/tick`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${TEST_CRON_SECRET}` },
@@ -344,14 +390,21 @@ test('API routes enforce owner lock, cron secret protection, and zero password l
     });
     assert.equal(rCronHeader.status, 200);
 
-    // 7. Unset CRON_SECRET returns 503; bad ENCRYPTION_KEY returns 400 on mailbox creation
-    currentEnv = { ENCRYPTION_KEY: 'invalid-short', CRON_SECRET: '' };
-    const rCronNoEnv = await fetch(`${baseUrl}/api/cron/tick`, {
+    // 7. Personal workspace cron tick rejects root secret and accepts its own auto-generated token
+    const rCronPersonalWrong = await fetch(`${baseUrl}/api/cron/tick?workspace=uid-second`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${TEST_CRON_SECRET}` },
     });
-    assert.equal(rCronNoEnv.status, 503);
+    assert.equal(rCronPersonalWrong.status, 401);
 
+    const rCronPersonalOk = await fetch(`${baseUrl}/api/cron/tick?workspace=uid-second`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${dashSecond.cronToken}` },
+    });
+    assert.equal(rCronPersonalOk.status, 200);
+
+    // 8. Malformed explicit ENCRYPTION_KEY override on root still fails closed with 400
+    currentEnv = { ENCRYPTION_KEY: 'invalid-short', CRON_SECRET: '' };
     const rBadKey = await fetch(`${baseUrl}/api/mailboxes`, {
       method: 'POST',
       headers: {
@@ -372,6 +425,123 @@ test('API routes enforce owner lock, cron secret protection, and zero password l
       }),
     });
     assert.equal(rBadKey.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test('Zero-config auto-generated secrets allow full mailbox encryption, cron execution, and token rotation without any env vars', async () => {
+  const stores = new Map<string, InMemoryWarmupStore>();
+  const getStore = (prefix = '') => {
+    let s = stores.get(prefix);
+    if (!s) {
+      s = new InMemoryWarmupStore();
+      stores.set(prefix, s);
+    }
+    return s;
+  };
+
+  const app = createApiApp({
+    verifyToken: async (idToken) => {
+      if (idToken === 'tok-alice') {
+        return { uid: 'uid-alice', email: 'alice@example.com', emailVerified: true, idToken };
+      }
+      throw new Error('Invalid token');
+    },
+    createUserStore: (_token, workspacePrefix = '') => getStore(workspacePrefix),
+    createCronStore: async (workspacePrefix = '') => getStore(workspacePrefix),
+    mailAdapter: createMockMailAdapter(),
+    aiCaller: null,
+    getEnv: () => ({}), // ZERO env vars configured!
+  });
+
+  const server = app.listen(0);
+  const port = (server.address() as AddressInfo).port;
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    // 1. Login auto-provisions encryptionKey & cronSecret
+    const rSess = await fetch(`${baseUrl}/api/auth/session`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer tok-alice' },
+    });
+    assert.equal(rSess.status, 200);
+    const sess = (await rSess.json()) as {
+      secrets: {
+        hasEncryptionKey: boolean;
+        encryptionKeyValid: boolean;
+        encryptionKeySource: string;
+        hasCronSecret: boolean;
+        cronSecretSource: string;
+      };
+    };
+    assert.equal(sess.secrets.hasEncryptionKey, true);
+    assert.equal(sess.secrets.encryptionKeyValid, true);
+    assert.equal(sess.secrets.encryptionKeySource, 'auto');
+    assert.equal(sess.secrets.hasCronSecret, true);
+    assert.equal(sess.secrets.cronSecretSource, 'auto');
+
+    // 2. Dashboard exposes cronToken but NEVER encryptionKey
+    const rDash = await fetch(`${baseUrl}/api/dashboard`, {
+      headers: { Authorization: 'Bearer tok-alice' },
+    });
+    assert.equal(rDash.status, 200);
+    const dashRaw = await rDash.text();
+    const storedSecrets = await getStore('').getRuntimeSecrets();
+    assert.ok(storedSecrets);
+    assert.equal(dashRaw.includes(storedSecrets.encryptionKey), false);
+    const dash = JSON.parse(dashRaw) as { cronToken?: string };
+    assert.equal(dash.cronToken, storedSecrets.cronSecret);
+
+    // 3. Create & test mailbox using auto-generated AES-256-GCM key
+    const rMb = await fetch(`${baseUrl}/api/mailboxes`, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer tok-alice',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        role: 'primary',
+        label: 'Alice Primary',
+        email: 'alice@domain.test',
+        password: 'AliceAppPassword!2026',
+        smtpHost: 'smtp.domain.test',
+        smtpPort: 465,
+        smtpSecurity: 'ssl_tls',
+        imapHost: 'imap.domain.test',
+        imapPort: 993,
+        imapSecurity: 'ssl_tls',
+      }),
+    });
+    assert.equal(rMb.status, 201);
+
+    // 4. Rotate cron token -> old token fails (401), new token succeeds (200), mailbox still decrypts!
+    const rRotate = await fetch(`${baseUrl}/api/cron/rotate-secret`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer tok-alice' },
+    });
+    assert.equal(rRotate.status, 200);
+    const rotated = (await rRotate.json()) as { cronToken: string };
+    assert.notEqual(rotated.cronToken, dash.cronToken);
+
+    const rCronOld = await fetch(`${baseUrl}/api/cron/tick`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${dash.cronToken}` },
+    });
+    assert.equal(rCronOld.status, 401);
+
+    const rCronNew = await fetch(`${baseUrl}/api/cron/tick`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${rotated.cronToken}` },
+    });
+    assert.equal(rCronNew.status, 200);
+
+    // Existing mailbox password must still decrypt after cron token rotation
+    const rTestMb = await fetch(`${baseUrl}/api/mailboxes/primary/test`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer tok-alice' },
+    });
+    assert.equal(rTestMb.status, 200);
   } finally {
     server.close();
   }

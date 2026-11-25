@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { CheckCircle2, Plus, Sparkles, Trash2, Users, AlertTriangle } from 'lucide-react';
+import { CheckCircle2, KeyRound, Plus, Sparkles, Trash2, Users, AlertTriangle } from 'lucide-react';
 import {
   RECOMMENDED_AI_MODELS,
   type AiTestResult,
@@ -12,6 +12,7 @@ interface AiAndAccessViewProps {
   settings: WarmupSettings;
   ownership: OwnershipDoc;
   isPrimaryOwner: boolean;
+  isPersonalWorkspace: boolean;
   secrets: SecretsStatus;
   onSaveSettings: (patch: Partial<WarmupSettings> & { coOwnerEmails?: string[] }) => Promise<void>;
   onTestAi: (model: string) => Promise<AiTestResult>;
@@ -21,6 +22,7 @@ export function AiAndAccessView({
   settings,
   ownership,
   isPrimaryOwner,
+  isPersonalWorkspace,
   secrets,
   onSaveSettings,
   onTestAi,
@@ -134,6 +136,51 @@ export function AiAndAccessView({
 
   return (
     <div className="max-w-3xl space-y-6">
+      {/* Automatic Security Keys Summary */}
+      <section className="bg-white border border-slate-200 rounded-lg p-6 space-y-4">
+        <div className="flex items-center gap-2 pb-3 border-b border-slate-100">
+          <KeyRound className="w-4 h-4 text-blue-700" />
+          <div>
+            <h2 className="text-base font-semibold text-slate-900">
+              Automatyczne klucze bezpieczeństwa
+            </h2>
+            <p className="text-xs text-slate-500">
+              Klucz szyfrowania haseł i token Cron są generowane automatycznie dla Twojego konta —
+              bez ręcznego ustawiania zmiennych środowiskowych.
+            </p>
+          </div>
+        </div>
+
+        <dl className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
+          <div className="p-3 bg-slate-50 border border-slate-200 rounded-md space-y-1">
+            <dt className="text-slate-500">Szyfrowanie haseł (AES-256-GCM)</dt>
+            <dd className="font-medium text-emerald-700">
+              {secrets.encryptionKeySource === 'auto'
+                ? 'Aktywne (auto-wygenerowane)'
+                : secrets.encryptionKeySource === 'env' && secrets.encryptionKeyValid
+                  ? 'Aktywne (ze zmiennej .env)'
+                  : 'Wymaga uwagi'}
+            </dd>
+          </div>
+          <div className="p-3 bg-slate-50 border border-slate-200 rounded-md space-y-1">
+            <dt className="text-slate-500">Autoryzacja Cron</dt>
+            <dd className="font-medium text-emerald-700">
+              {secrets.cronSecretSource === 'auto'
+                ? 'Aktywna (auto-wygenerowana)'
+                : secrets.cronSecretSource === 'env'
+                  ? 'Aktywna (ze zmiennej .env)'
+                  : 'Brak tokenu'}
+            </dd>
+          </div>
+          <div className="p-3 bg-slate-50 border border-slate-200 rounded-md space-y-1">
+            <dt className="text-slate-500">Silnik treści AI (Gemini)</dt>
+            <dd className={`font-medium ${secrets.hasGeminiKey ? 'text-emerald-700' : 'text-amber-700'}`}>
+              {secrets.hasGeminiKey ? 'Połączony (klucz serwera)' : 'Wbudowane szablony (fallback)'}
+            </dd>
+          </div>
+        </dl>
+      </section>
+
       {/* Gemini AI Config */}
       <form
         onSubmit={handleSaveModel}
@@ -152,8 +199,8 @@ export function AiAndAccessView({
             }`}
           >
             {secrets.hasGeminiKey
-              ? 'GEMINI_API_KEY obecny · Fallback gotowy'
-              : 'Tryb fallback aktywny (brak GEMINI_API_KEY)'}
+              ? 'Klucz AI serwera aktywny · Fallback gotowy'
+              : 'Tryb fallback aktywny (wbudowane szablony)'}
           </span>
         </div>
 
@@ -188,12 +235,10 @@ export function AiAndAccessView({
           )}
 
           <p className="text-xs text-slate-500 leading-relaxed">
-            Klucz <span className="font-mono">GEMINI_API_KEY</span> jest odczytywany wyłącznie po
-            stronie serwera ze zmiennych środowiskowych (<span className="font-mono">.env</span> /
-            panel hostingu) — każda samodzielna instancja korzysta z własnego klucza bez przekazywania
-            go do przeglądarki. W razie błędu limitu <span className="font-mono">429</span>, błędu
-            sieci, nieobsługiwanego modelu (<span className="font-mono">404</span>) lub braku klucza,
-            silnik automatycznie przełączy się na wbudowaną pulę neutralnych szablonów konwersacyjnych.
+            Połączenie z Gemini AI jest obsługiwane automatycznie po stronie serwera. W razie braku
+            klucza po stronie serwera, przekroczenia limitu (<span className="font-mono">429</span>)
+            lub błędu sieci, silnik automatycznie korzysta z wbudowanej puli naturalnych szablonów
+            konwersacyjnych.
           </p>
         </div>
 
@@ -259,91 +304,117 @@ export function AiAndAccessView({
         </div>
       </form>
 
-      {/* Owner & Co-Owners Management */}
-      <section className="bg-white border border-slate-200 rounded-lg p-6 space-y-5">
-        <div className="flex items-center gap-2 pb-4 border-b border-slate-100">
-          <Users className="w-4 h-4 text-slate-700" />
-          <div>
-            <h2 className="text-base font-semibold text-slate-900">Właściciel i współwłaściciele</h2>
-            <p className="text-xs text-slate-500">
-              Wszystkie pozostałe konta Google otrzymują odpowiedź 403 Forbidden.
-            </p>
+      {/* Workspace Access Management */}
+      {isPersonalWorkspace ? (
+        <section className="bg-white border border-slate-200 rounded-lg p-6 space-y-3">
+          <div className="flex items-center gap-2 pb-3 border-b border-slate-100">
+            <Users className="w-4 h-4 text-slate-700" />
+            <div>
+              <h2 className="text-base font-semibold text-slate-900">
+                Twoja prywatna przestrzeń robocza
+              </h2>
+              <p className="text-xs text-slate-500">
+                Wszystkie Twoje skrzynki, hasła, harmonogram, logi i token Cron są w pełni
+                odizolowane od innych użytkowników.
+              </p>
+            </div>
           </div>
-        </div>
-
-        <div className="text-xs space-y-1">
-          <span className="text-slate-500">Główny właściciel (zapisany przy 1. logowaniu):</span>
-          <div className="font-mono text-sm text-slate-900 font-medium">
-            {ownership.ownerEmail}
+          <div className="text-xs space-y-1">
+            <span className="text-slate-500">Zalogowane konto Google:</span>
+            <div className="font-mono text-sm text-slate-900 font-medium">
+              {ownership.ownerEmail}
+            </div>
           </div>
-        </div>
-
-        {isPrimaryOwner && (
-          <form onSubmit={handleAddCoOwner} className="flex flex-col sm:flex-row gap-2.5">
-            <input
-              type="email"
-              value={newCoOwner}
-              onChange={(e) => setNewCoOwner(e.target.value)}
-              placeholder="wspolwlasciciel@gmail.com"
-              className="flex-1 px-3 py-2 text-sm font-mono bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-700"
-            />
-            <button
-              type="submit"
-              disabled={savingAccess || !newCoOwner.trim()}
-              className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-sm font-medium text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap"
-            >
-              <Plus className="w-4 h-4" />
-              Dodaj współwłaściciela
-            </button>
-          </form>
-        )}
-
-        {accessMessage && (
-          <div
-            role="status"
-            className={`p-3 rounded-md text-xs border ${
-              accessMessage.type === 'ok'
-                ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
-                : 'bg-red-50 border-red-200 text-red-800'
-            }`}
-          >
-            {accessMessage.text}
+        </section>
+      ) : (
+        <section className="bg-white border border-slate-200 rounded-lg p-6 space-y-5">
+          <div className="flex items-center gap-2 pb-4 border-b border-slate-100">
+            <Users className="w-4 h-4 text-slate-700" />
+            <div>
+              <h2 className="text-base font-semibold text-slate-900">
+                Właściciel i współwłaściciele przestrzeni głównej
+              </h2>
+              <p className="text-xs text-slate-500">
+                Dodani współwłaściciele współdzielą tę przestrzeń. Wszystkie inne konta Google po
+                zalogowaniu automatycznie otrzymują własną, odizolowaną przestrzeń roboczą.
+              </p>
+            </div>
           </div>
-        )}
 
-        <div className="space-y-2">
-          <span className="text-xs font-medium text-slate-700 block">
-            Lista współwłaścicieli ({coOwners.length}/10)
-          </span>
-          {coOwners.length === 0 ? (
-            <p className="text-xs text-slate-500">
-              Brak dodanych współwłaścicieli — dostęp ma wyłącznie Twoje konto główne.
-            </p>
-          ) : (
-            <ul className="divide-y divide-slate-100 border border-slate-200 rounded-md">
-              {coOwners.map((email) => (
-                <li
-                  key={email}
-                  className="flex items-center justify-between gap-3 px-3.5 py-2.5 text-xs"
-                >
-                  <span className="font-mono text-slate-800">{email}</span>
-                  {isPrimaryOwner && (
-                    <button
-                      type="button"
-                      disabled={savingAccess}
-                      onClick={() => void handleRemoveCoOwner(email)}
-                      aria-label={`Usuń współwłaściciela ${email}`}
-                      className="text-red-600 hover:text-red-800 p-1 rounded hover:bg-red-50"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                </li>
-              ))}
-            </ul>
+          <div className="text-xs space-y-1">
+            <span className="text-slate-500">Główny właściciel:</span>
+            <div className="font-mono text-sm text-slate-900 font-medium">
+              {ownership.ownerEmail}
+            </div>
+          </div>
+
+          {isPrimaryOwner && (
+            <form onSubmit={handleAddCoOwner} className="flex flex-col sm:flex-row gap-2.5">
+              <input
+                type="email"
+                value={newCoOwner}
+                onChange={(e) => setNewCoOwner(e.target.value)}
+                placeholder="wspolwlasciciel@gmail.com"
+                className="flex-1 px-3 py-2 text-sm font-mono bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-700"
+              />
+              <button
+                type="submit"
+                disabled={savingAccess || !newCoOwner.trim()}
+                className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-sm font-medium text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap"
+              >
+                <Plus className="w-4 h-4" />
+                Dodaj współwłaściciela
+              </button>
+            </form>
           )}
-        </div>
-      </section>
+
+          {accessMessage && (
+            <div
+              role="status"
+              className={`p-3 rounded-md text-xs border ${
+                accessMessage.type === 'ok'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  : 'bg-red-50 border-red-200 text-red-800'
+              }`}
+            >
+              {accessMessage.text}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <span className="text-xs font-medium text-slate-700 block">
+              Lista współwłaścicieli ({coOwners.length}/10)
+            </span>
+            {coOwners.length === 0 ? (
+              <p className="text-xs text-slate-500">
+                Brak dodanych współwłaścicieli — tę przestrzeń obsługuje wyłącznie Twoje konto.
+              </p>
+            ) : (
+              <ul className="divide-y divide-slate-100 border border-slate-200 rounded-md">
+                {coOwners.map((email) => (
+                  <li
+                    key={email}
+                    className="flex items-center justify-between gap-3 px-3.5 py-2.5 text-xs"
+                  >
+                    <span className="font-mono text-slate-800">{email}</span>
+                    {isPrimaryOwner && (
+                      <button
+                        type="button"
+                        disabled={savingAccess}
+                        onClick={() => void handleRemoveCoOwner(email)}
+                        aria-label={`Usuń współwłaściciela ${email}`}
+                        className="text-red-600 hover:text-red-800 p-1 rounded hover:bg-red-50"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+      )}
     </div>
   );
 }

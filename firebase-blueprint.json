@@ -2,7 +2,7 @@
   "entities": {
     "Ownership": {
       "title": "Ownership",
-      "description": "Single-tenant owner lock and co-owner allowlist initialized by the first Google Sign-In user.",
+      "description": "Workspace owner record and optional co-owner email allowlist.",
       "type": "object",
       "properties": {
         "ownerUid": {
@@ -33,6 +33,42 @@
         }
       },
       "required": ["ownerUid", "ownerEmail", "coOwnerEmails", "createdAt", "updatedAt"]
+    },
+    "RuntimeSecrets": {
+      "title": "RuntimeSecrets",
+      "description": "Auto-generated per-workspace AES-256-GCM encryption key (immutable once created) and rotatable Cron bearer token.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "encryptionKey": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "cronSecret": {
+          "type": "string",
+          "minLength": 32,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 64
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 64
+        }
+      },
+      "required": ["ownerUid", "encryptionKey", "cronSecret", "createdAt", "updatedAt"]
     },
     "WarmupSettings": {
       "title": "WarmupSettings",
@@ -244,7 +280,7 @@
     },
     "ExecutionLock": {
       "title": "ExecutionLock",
-      "description": "Transactional TTL lock preventing overlapping warm-up ticks.",
+      "description": "Atomic TTL lock preventing overlapping warm-up ticks.",
       "type": "object",
       "properties": {
         "ownerUid": {
@@ -264,35 +300,75 @@
   "firestore": {
     "/system/ownership": {
       "schema": { "$ref": "#/entities/Ownership" },
-      "description": "Singleton document storing the primary ownerUid and optional co-owner emails."
+      "description": "Primary root workspace ownership record and co-owner allowlist."
+    },
+    "/runtime_secrets/{secretId}": {
+      "schema": { "$ref": "#/entities/RuntimeSecrets" },
+      "description": "Auto-generated encryption key and Cron token for root workspace."
     },
     "/settings/warmup": {
       "schema": { "$ref": "#/entities/WarmupSettings" },
-      "description": "Singleton warm-up schedule, format, and AI configuration document."
+      "description": "Root workspace warm-up schedule, format, and AI model configuration."
     },
     "/mailboxes/{mailboxId}": {
       "schema": { "$ref": "#/entities/Mailbox" },
-      "description": "Primary and helper mailbox SMTP/IMAP configuration metadata."
+      "description": "Root workspace primary and helper mailbox SMTP/IMAP configuration."
     },
     "/mailbox_secrets/{mailboxId}": {
       "schema": { "$ref": "#/entities/MailboxSecret" },
-      "description": "AES-256-GCM encrypted mailbox passwords."
+      "description": "Root workspace AES-256-GCM encrypted mailbox passwords."
     },
     "/threads/{threadId}": {
       "schema": { "$ref": "#/entities/WarmupThread" },
-      "description": "Sent warm-up threads keyed by hash of Message-ID."
+      "description": "Root workspace sent warm-up threads keyed by Message-ID hash."
     },
     "/daily_stats/{dateKey}": {
       "schema": { "$ref": "#/entities/DailyStats" },
-      "description": "Per-day warm-up counters in the configured timezone."
+      "description": "Root workspace per-day warm-up counters."
     },
     "/logs/{logId}": {
       "schema": { "$ref": "#/entities/WarmupLog" },
-      "description": "Sanitized operational event logs."
+      "description": "Root workspace sanitized operational event logs."
     },
     "/locks/{lockId}": {
       "schema": { "$ref": "#/entities/ExecutionLock" },
-      "description": "Transactional execution lock with 2-minute TTL."
+      "description": "Root workspace execution lock with 2-minute TTL."
+    },
+    "/users/{userId}/system/ownership": {
+      "schema": { "$ref": "#/entities/Ownership" },
+      "description": "Per-user isolated workspace ownership document."
+    },
+    "/users/{userId}/runtime_secrets/{secretId}": {
+      "schema": { "$ref": "#/entities/RuntimeSecrets" },
+      "description": "Per-user auto-generated encryption key and rotatable Cron token."
+    },
+    "/users/{userId}/settings/warmup": {
+      "schema": { "$ref": "#/entities/WarmupSettings" },
+      "description": "Per-user isolated warm-up schedule and model settings."
+    },
+    "/users/{userId}/mailboxes/{mailboxId}": {
+      "schema": { "$ref": "#/entities/Mailbox" },
+      "description": "Per-user isolated primary and helper mailboxes."
+    },
+    "/users/{userId}/mailbox_secrets/{mailboxId}": {
+      "schema": { "$ref": "#/entities/MailboxSecret" },
+      "description": "Per-user isolated AES-256-GCM encrypted mailbox passwords."
+    },
+    "/users/{userId}/threads/{threadId}": {
+      "schema": { "$ref": "#/entities/WarmupThread" },
+      "description": "Per-user isolated warm-up threads."
+    },
+    "/users/{userId}/daily_stats/{dateKey}": {
+      "schema": { "$ref": "#/entities/DailyStats" },
+      "description": "Per-user isolated daily stats."
+    },
+    "/users/{userId}/logs/{logId}": {
+      "schema": { "$ref": "#/entities/WarmupLog" },
+      "description": "Per-user isolated operational logs."
+    },
+    "/users/{userId}/locks/{lockId}": {
+      "schema": { "$ref": "#/entities/ExecutionLock" },
+      "description": "Per-user isolated execution lock."
     }
   }
 }

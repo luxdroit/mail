@@ -122,4 +122,10 @@ export const apiClient = {
       body: JSON.stringify({ bypassWindowAndDelay }),
     });
   },
+
+  rotateCronSecret(idToken: string): Promise<{ cronToken: string }> {
+    return apiFetch<{ cronToken: string }>('/api/cron/rotate-secret', idToken, {
+      method: 'POST',
+    });
+  },
 };

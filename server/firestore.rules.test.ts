@@ -16,6 +16,18 @@ test('firestore.rules enforces verified email and blocks mailbox_secrets list an
   assert.match(rulesContent, /\^v1:\[0-9a-f\]\+:\[0-9a-f\]\+:\[0-9a-f\]\+\$/);
 });
 
+test('firestore.rules secures runtime_secrets with immutable encryptionKey and blocks list/delete', () => {
+  assert.match(rulesContent, /match \/runtime_secrets\/\{secretId\}[\s\S]*?allow list: if false;[\s\S]*?allow delete: if false;/);
+  assert.match(rulesContent, /incoming\(\)\.encryptionKey == existing\(\)\.encryptionKey/);
+  assert.match(rulesContent, /match \/users\/\{userId\}\/runtime_secrets\/\{secretId\}[\s\S]*?allow list: if false;[\s\S]*?allow delete: if false;/);
+});
+
+test('firestore.rules secures isolated per-user workspaces by UID', () => {
+  assert.match(rulesContent, /function isUserWorkspaceOwner\(userId\)[\s\S]*?request\.auth\.uid == userId/);
+  assert.match(rulesContent, /match \/users\/\{userId\}\/mailboxes\/\{mailboxId\}[\s\S]*?allow list: if matchesPersonalResource\(userId\);/);
+  assert.match(rulesContent, /match \/users\/\{userId\}\/mailbox_secrets\/\{mailboxId\}[\s\S]*?allow list: if false;/);
+});
+
 test('firestore.rules secures ownership claim, immutability, and query-enforced list rules', () => {
   assert.match(rulesContent, /match \/system\/ownership[\s\S]*?!ownershipExists\(\)[\s\S]*?incoming\(\)\.ownerUid == request\.auth\.uid/);
   assert.match(rulesContent, /incoming\(\)\.ownerUid == existing\(\)\.ownerUid/);
