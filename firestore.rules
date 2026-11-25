@@ -1,0 +1,414 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Global Hardened Primitives ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidIsoDate(val) {
+      return val is string && val.size() >= 10 && val.size() <= 64;
+    }
+
+    function isValidDateKey(val) {
+      return val is string && val.size() == 10 && val.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function isValidEmail(val) {
+      return val is string && val.size() >= 3 && val.size() <= 254 && val.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$');
+    }
+
+    function isValidCoOwnerList(arr) {
+      return arr is list && arr.size() <= 10 && (arr.size() == 0 || (arr[0] is string && arr[0].size() <= 254));
+    }
+
+    function isValidAllowedEmails(arr) {
+      return arr is list && arr.size() <= 11 && (arr.size() == 0 || (arr[0] is string && arr[0].size() <= 254));
+    }
+
+    function ownershipExists() {
+      return exists(/databases/$(database)/documents/system/ownership);
+    }
+
+    function ownershipData() {
+      return get(/databases/$(database)/documents/system/ownership).data;
+    }
+
+    function isPrimaryOwner() {
+      return isVerified() && ownershipExists() && request.auth.uid == ownershipData().ownerUid;
+    }
+
+    function isOwnerOrCoOwner() {
+      return isVerified() && ownershipExists() && (
+        request.auth.uid == ownershipData().ownerUid ||
+        (request.auth.token.email is string && request.auth.token.email in ownershipData().coOwnerEmails)
+      );
+    }
+
+    function matchesResourceAccess() {
+      return isVerified() && (
+        resource.data.ownerUid == request.auth.uid ||
+        (
+          resource.data.keys().hasAll(['allowedEmails']) &&
+          resource.data.allowedEmails is list &&
+          resource.data.allowedEmails.size() <= 11 &&
+          request.auth.token.email is string &&
+          request.auth.token.email in resource.data.allowedEmails
+        )
+      );
+    }
+
+    // --- Validation Blueprints (Pillar 2: Anti-Update-Gap) ---
+    function isValidOwnership(data) {
+      return data.keys().hasAll(['ownerUid', 'ownerEmail', 'coOwnerEmails', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'ownerEmail', 'coOwnerEmails', 'createdAt', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && isValidEmail(data.ownerEmail)
+        && isValidCoOwnerList(data.coOwnerEmails)
+        && isValidIsoDate(data.createdAt)
+        && isValidIsoDate(data.updatedAt);
+    }
+
+    function isValidWarmupSettings(data) {
+      return data.keys().hasAll([
+          'ownerUid', 'allowedEmails', 'enabled', 'startDateKey', 'startDailyCount',
+          'dailyIncrement', 'maxDailyCap', 'minDelayMinutes', 'maxDelayMinutes',
+          'windowStartHour', 'windowEndHour', 'timezone', 'messageFormat',
+          'aiModel', 'lastHelperIndex', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid', 'allowedEmails', 'enabled', 'startDateKey', 'startDailyCount',
+          'dailyIncrement', 'maxDailyCap', 'minDelayMinutes', 'maxDelayMinutes',
+          'windowStartHour', 'windowEndHour', 'timezone', 'messageFormat',
+          'aiModel', 'lastSentAt', 'nextAllowedSendAt', 'lastHelperIndex', 'updatedAt'
+        ])
+        && isValidId(data.ownerUid)
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.enabled is bool
+        && isValidDateKey(data.startDateKey)
+        && data.startDailyCount is int && data.startDailyCount >= 1 && data.startDailyCount <= 200
+        && data.dailyIncrement is int && data.dailyIncrement >= 0 && data.dailyIncrement <= 50
+        && data.maxDailyCap is int && data.maxDailyCap >= 1 && data.maxDailyCap <= 500
+        && data.minDelayMinutes is int && data.minDelayMinutes >= 1 && data.minDelayMinutes <= 1440
+        && data.maxDelayMinutes is int && data.maxDelayMinutes >= data.minDelayMinutes && data.maxDelayMinutes <= 1440
+        && data.windowStartHour is int && data.windowStartHour >= 0 && data.windowStartHour <= 23
+        && data.windowEndHour is int && data.windowEndHour >= 1 && data.windowEndHour <= 24 && data.windowEndHour > data.windowStartHour
+        && data.timezone is string && data.timezone.size() >= 1 && data.timezone.size() <= 64
+        && (data.messageFormat == 'plain' || data.messageFormat == 'light_html')
+        && data.aiModel is string && data.aiModel.size() >= 1 && data.aiModel.size() <= 80
+        && data.lastHelperIndex is int && data.lastHelperIndex >= 0
+        && isValidIsoDate(data.updatedAt)
+        && (!('lastSentAt' in data) || data.lastSentAt == '' || isValidIsoDate(data.lastSentAt))
+        && (!('nextAllowedSendAt' in data) || data.nextAllowedSendAt == '' || isValidIsoDate(data.nextAllowedSendAt));
+    }
+
+    function isValidMailbox(data) {
+      return data.keys().hasAll([
+          'ownerUid', 'allowedEmails', 'role', 'label', 'email',
+          'smtpHost', 'smtpPort', 'smtpSecurity',
+          'imapHost', 'imapPort', 'imapSecurity',
+          'active', 'hasPassword', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid', 'allowedEmails', 'role', 'label', 'email',
+          'smtpHost', 'smtpPort', 'smtpSecurity',
+          'imapHost', 'imapPort', 'imapSecurity',
+          'active', 'hasPassword', 'lastTestedAt', 'lastTestStatus',
+          'lastTestMessage', 'lastCheckedAt', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerUid)
+        && isValidAllowedEmails(data.allowedEmails)
+        && (data.role == 'primary' || data.role == 'helper')
+        && data.label is string && data.label.size() >= 1 && data.label.size() <= 100
+        && isValidEmail(data.email)
+        && data.smtpHost is string && data.smtpHost.size() >= 1 && data.smtpHost.size() <= 253
+        && data.smtpPort is int && data.smtpPort >= 1 && data.smtpPort <= 65535
+        && (data.smtpSecurity == 'ssl_tls' || data.smtpSecurity == 'starttls')
+        && data.imapHost is string && data.imapHost.size() >= 1 && data.imapHost.size() <= 253
+        && data.imapPort is int && data.imapPort >= 1 && data.imapPort <= 65535
+        && (data.imapSecurity == 'ssl_tls' || data.imapSecurity == 'starttls')
+        && data.active is bool
+        && data.hasPassword is bool
+        && isValidIsoDate(data.createdAt)
+        && isValidIsoDate(data.updatedAt)
+        && (!('lastTestedAt' in data) || data.lastTestedAt == '' || isValidIsoDate(data.lastTestedAt))
+        && (!('lastTestStatus' in data) || data.lastTestStatus == 'ok' || data.lastTestStatus == 'error' || data.lastTestStatus == 'none')
+        && (!('lastTestMessage' in data) || (data.lastTestMessage is string && data.lastTestMessage.size() <= 500))
+        && (!('lastCheckedAt' in data) || data.lastCheckedAt == '' || isValidIsoDate(data.lastCheckedAt));
+    }
+
+    function isValidMailboxSecret(data) {
+      return data.keys().hasAll(['ownerUid', 'encryptedPassword', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'encryptedPassword', 'updatedAt'])
+        && isValidId(data.ownerUid)
+        && data.encryptedPassword is string
+        && data.encryptedPassword.size() >= 32
+        && data.encryptedPassword.size() <= 2048
+        && data.encryptedPassword.matches('^v1:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+$')
+        && isValidIsoDate(data.updatedAt);
+    }
+
+    function isValidThread(data) {
+      return data.keys().hasAll([
+          'ownerUid', 'allowedEmails', 'messageId', 'primaryMailboxId',
+          'helperMailboxId', 'helperEmail', 'subject', 'format',
+          'usedFallback', 'status', 'foundInSpam', 'sentAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid', 'allowedEmails', 'messageId', 'primaryMailboxId',
+          'helperMailboxId', 'helperEmail', 'subject', 'bodySnippet', 'format',
+          'usedFallback', 'status', 'foundInSpam', 'sentAt', 'repliedAt', 'replyMessageId'
+        ])
+        && isValidId(data.ownerUid)
+        && isValidAllowedEmails(data.allowedEmails)
+        && data.messageId is string && data.messageId.size() >= 3 && data.messageId.size() <= 512
+        && isValidId(data.primaryMailboxId)
+        && isValidId(data.helperMailboxId)
+        && isValidEmail(data.helperEmail)
+        && data.subject is string && data.subject.size() >= 1 && data.subject.size() <= 300
+        && (!('bodySnippet' in data) || (data.bodySnippet is string && data.bodySnippet.size() <= 1000))
+        && (data.format == 'plain' || data.format == 'light_html')
+        && data.usedFallback is bool
+        && (data.status == 'sent' || data.status == 'replied' || data.status == 'failed')
+        && data.foundInSpam is bool
+        && isValidIsoDate(data.sentAt)
+        && (!('repliedAt' in data) || data.repliedAt == '' || isValidIsoDate(data.repliedAt))
+        && (!('replyMessageId' in data) || (data.replyMessageId is string && data.replyMessageId.size() <= 512));
+    }
+
+    function isValidDailyStats(data) {
+      return data.keys().hasAll([
+          'ownerUid', 'allowedEmails', 'dateKey', 'dayIndex', 'targetLimit',
+          'sentCount', 'repliedCount', 'rescuedFromSpamCount', 'fallbackCount',
+          'errorCount', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid', 'allowedEmails', 'dateKey', 'dayIndex', 'targetLimit',
+          'sentCount', 'repliedCount', 'rescuedFromSpamCount', 'fallbackCount',
+          'errorCount', 'updatedAt'
+        ])
+        && isValidId(data.ownerUid)
+        && isValidAllowedEmails(data.allowedEmails)
+        && isValidDateKey(data.dateKey)
+        && data.dayIndex is int && data.dayIndex >= 0
+        && data.targetLimit is int && data.targetLimit >= 0 && data.targetLimit <= 500
+        && data.sentCount is int && data.sentCount >= 0
+        && data.repliedCount is int && data.repliedCount >= 0
+        && data.rescuedFromSpamCount is int && data.rescuedFromSpamCount >= 0
+        && data.fallbackCount is int && data.fallbackCount >= 0
+        && data.errorCount is int && data.errorCount >= 0
+        && isValidIsoDate(data.updatedAt);
+    }
+
+    function isValidLog(data) {
+      return data.keys().hasAll(['ownerUid', 'allowedEmails', 'level', 'category', 'message', 'createdAt'])
+        && data.keys().hasOnly(['ownerUid', 'allowedEmails', 'level', 'category', 'message', 'createdAt'])
+        && isValidId(data.ownerUid)
+        && isValidAllowedEmails(data.allowedEmails)
+        && (data.level == 'info' || data.level == 'warn' || data.level == 'error')
+        && (
+          data.category == 'send' || data.category == 'imap' || data.category == 'reply' ||
+          data.category == 'ai' || data.category == 'cron' || data.category == 'auth' || data.category == 'test'
+        )
+        && data.message is string && data.message.size() >= 1 && data.message.size() <= 500
+        && isValidIsoDate(data.createdAt);
+    }
+
+    function isValidLock(data) {
+      return data.keys().hasAll(['ownerUid', 'lockedBy', 'source', 'acquiredAtMs', 'expiresAtMs'])
+        && data.keys().hasOnly(['ownerUid', 'lockedBy', 'source', 'acquiredAtMs', 'expiresAtMs'])
+        && isValidId(data.ownerUid)
+        && data.lockedBy is string && data.lockedBy.size() >= 1 && data.lockedBy.size() <= 128
+        && (data.source == 'cron' || data.source == 'manual')
+        && data.acquiredAtMs is int && data.acquiredAtMs >= 0
+        && data.expiresAtMs is int && data.expiresAtMs >= data.acquiredAtMs;
+    }
+
+    // --- Collection Rules ---
+
+    // 1. Single-tenant ownership record
+    match /system/ownership {
+      allow list: if false;
+      allow delete: if false;
+      allow get: if isVerified() && (!ownershipExists() || isOwnerOrCoOwner());
+      allow create: if isVerified()
+        && isValidOwnership(incoming())
+        && !ownershipExists()
+        && incoming().ownerUid == request.auth.uid
+        && incoming().ownerEmail == request.auth.token.email;
+      allow update: if isVerified()
+        && isValidOwnership(incoming())
+        && isPrimaryOwner()
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().ownerEmail == existing().ownerEmail
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['coOwnerEmails', 'updatedAt']);
+    }
+
+    // 2. Warmup Settings singleton
+    match /settings/warmup {
+      allow list: if false;
+      allow delete: if false;
+      allow get: if isOwnerOrCoOwner();
+      allow create: if isVerified()
+        && isValidWarmupSettings(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == ownershipData().ownerUid;
+      allow update: if isVerified()
+        && isValidWarmupSettings(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'allowedEmails', 'enabled', 'startDateKey', 'startDailyCount',
+          'dailyIncrement', 'maxDailyCap', 'minDelayMinutes', 'maxDelayMinutes',
+          'windowStartHour', 'windowEndHour', 'timezone', 'messageFormat',
+          'aiModel', 'lastSentAt', 'nextAllowedSendAt', 'lastHelperIndex', 'updatedAt'
+        ]);
+    }
+
+    // 3. Mailboxes (no passwords stored here)
+    match /mailboxes/{mailboxId} {
+      allow list: if matchesResourceAccess();
+      allow get: if isValidId(mailboxId) && isOwnerOrCoOwner();
+      allow create: if isVerified()
+        && isValidId(mailboxId)
+        && isValidMailbox(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == ownershipData().ownerUid;
+      allow update: if isVerified()
+        && isValidId(mailboxId)
+        && isValidMailbox(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'allowedEmails', 'role', 'label', 'email',
+          'smtpHost', 'smtpPort', 'smtpSecurity',
+          'imapHost', 'imapPort', 'imapSecurity',
+          'active', 'hasPassword', 'lastTestedAt', 'lastTestStatus',
+          'lastTestMessage', 'lastCheckedAt', 'updatedAt'
+        ]);
+      allow delete: if isValidId(mailboxId) && isOwnerOrCoOwner();
+    }
+
+    // 4. Encrypted Mailbox Secrets (ciphertext only, list forbidden)
+    match /mailbox_secrets/{mailboxId} {
+      allow list: if false;
+      allow get: if isValidId(mailboxId) && isOwnerOrCoOwner();
+      allow create: if isVerified()
+        && isValidId(mailboxId)
+        && isValidMailboxSecret(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == ownershipData().ownerUid;
+      allow update: if isVerified()
+        && isValidId(mailboxId)
+        && isValidMailboxSecret(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().diff(existing()).affectedKeys().hasOnly(['encryptedPassword', 'updatedAt']);
+      allow delete: if isValidId(mailboxId) && isOwnerOrCoOwner();
+    }
+
+    // 5. Warmup Threads tracked by Message-ID
+    match /threads/{threadId} {
+      allow list: if matchesResourceAccess();
+      allow get: if isValidId(threadId) && isOwnerOrCoOwner();
+      allow create: if isVerified()
+        && isValidId(threadId)
+        && isValidThread(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == ownershipData().ownerUid;
+      allow update: if isVerified()
+        && isValidId(threadId)
+        && isValidThread(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().messageId == existing().messageId
+        && incoming().sentAt == existing().sentAt
+        && existing().status != 'replied'
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'allowedEmails', 'status', 'foundInSpam', 'repliedAt', 'replyMessageId'
+        ]);
+      allow delete: if false;
+    }
+
+    // 6. Daily Stats
+    match /daily_stats/{dateKey} {
+      allow list: if matchesResourceAccess();
+      allow get: if isValidDateKey(dateKey) && isOwnerOrCoOwner();
+      allow create: if isVerified()
+        && isValidDateKey(dateKey)
+        && isValidDailyStats(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == ownershipData().ownerUid
+        && incoming().dateKey == dateKey;
+      allow update: if isVerified()
+        && isValidDateKey(dateKey)
+        && isValidDailyStats(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().dateKey == existing().dateKey
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'allowedEmails', 'dayIndex', 'targetLimit', 'sentCount',
+          'repliedCount', 'rescuedFromSpamCount', 'fallbackCount',
+          'errorCount', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // 7. Operational Logs (append-only)
+    match /logs/{logId} {
+      allow list: if matchesResourceAccess();
+      allow get: if isValidId(logId) && isOwnerOrCoOwner();
+      allow create: if isVerified()
+        && isValidId(logId)
+        && isValidLog(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == ownershipData().ownerUid;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // 8. Transactional Execution Locks
+    match /locks/{lockId} {
+      allow list: if false;
+      allow get: if isValidId(lockId) && isOwnerOrCoOwner();
+      allow create: if isVerified()
+        && isValidId(lockId)
+        && isValidLock(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == ownershipData().ownerUid;
+      allow update: if isVerified()
+        && isValidId(lockId)
+        && isValidLock(incoming())
+        && isOwnerOrCoOwner()
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'lockedBy', 'source', 'acquiredAtMs', 'expiresAtMs'
+        ]);
+      allow delete: if isValidId(lockId) && isOwnerOrCoOwner();
+    }
+  }
+}

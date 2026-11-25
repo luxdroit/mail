@@ -1,0 +1,8 @@
+{
+  "name": "MailPulse Warm-up Console",
+  "description": "Kontrolowane rozgrzewanie i testowanie dostarczalności skrzynek e-mail (SMTP/IMAP) z Gemini API, szyfrowaniem AES-256-GCM, Firebase Firestore i bezstanowym cronem.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

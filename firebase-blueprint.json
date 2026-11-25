@@ -1,0 +1,298 @@
+{
+  "entities": {
+    "Ownership": {
+      "title": "Ownership",
+      "description": "Single-tenant owner lock and co-owner allowlist initialized by the first Google Sign-In user.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "coOwnerEmails": {
+          "type": "array",
+          "description": "Optional allowlist of up to 10 co-owner email addresses."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 64
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 64
+        }
+      },
+      "required": ["ownerUid", "ownerEmail", "coOwnerEmails", "createdAt", "updatedAt"]
+    },
+    "WarmupSettings": {
+      "title": "WarmupSettings",
+      "description": "Warm-up schedule, ramp-up parameters, message format, and Gemini model configuration.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "enabled": { "type": "boolean" },
+        "startDateKey": {
+          "type": "string",
+          "maxLength": 10,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "startDailyCount": { "type": "integer" },
+        "dailyIncrement": { "type": "integer" },
+        "maxDailyCap": { "type": "integer" },
+        "minDelayMinutes": { "type": "integer" },
+        "maxDelayMinutes": { "type": "integer" },
+        "windowStartHour": { "type": "integer" },
+        "windowEndHour": { "type": "integer" },
+        "timezone": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "messageFormat": { "type": "string", "enum": ["plain", "light_html"] },
+        "aiModel": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "lastSentAt": { "type": "string", "maxLength": 64 },
+        "nextAllowedSendAt": { "type": "string", "maxLength": 64 },
+        "lastHelperIndex": { "type": "integer" },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": [
+        "ownerUid",
+        "enabled",
+        "startDateKey",
+        "startDailyCount",
+        "dailyIncrement",
+        "maxDailyCap",
+        "minDelayMinutes",
+        "maxDelayMinutes",
+        "windowStartHour",
+        "windowEndHour",
+        "timezone",
+        "messageFormat",
+        "aiModel",
+        "lastHelperIndex",
+        "updatedAt"
+      ]
+    },
+    "Mailbox": {
+      "title": "Mailbox",
+      "description": "SMTP/IMAP configuration for the primary warm-up mailbox or a helper mailbox (no plaintext passwords).",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": { "type": "string", "enum": ["primary", "helper"] },
+        "label": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "email": { "type": "string", "format": "email", "minLength": 3, "maxLength": 254 },
+        "smtpHost": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "smtpPort": { "type": "integer" },
+        "smtpSecurity": { "type": "string", "enum": ["ssl_tls", "starttls"] },
+        "imapHost": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "imapPort": { "type": "integer" },
+        "imapSecurity": { "type": "string", "enum": ["ssl_tls", "starttls"] },
+        "active": { "type": "boolean" },
+        "hasPassword": { "type": "boolean" },
+        "lastTestedAt": { "type": "string", "maxLength": 64 },
+        "lastTestStatus": { "type": "string", "enum": ["ok", "error", "none"] },
+        "lastTestMessage": { "type": "string", "maxLength": 500 },
+        "lastCheckedAt": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": [
+        "ownerUid",
+        "role",
+        "label",
+        "email",
+        "smtpHost",
+        "smtpPort",
+        "smtpSecurity",
+        "imapHost",
+        "imapPort",
+        "imapSecurity",
+        "active",
+        "hasPassword",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "MailboxSecret": {
+      "title": "MailboxSecret",
+      "description": "AES-256-GCM encrypted mailbox password payload (v1:iv:tag:ciphertext). Isolated from public access.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "encryptedPassword": {
+          "type": "string",
+          "minLength": 32,
+          "maxLength": 2048,
+          "pattern": "^v1:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+$"
+        },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["ownerUid", "encryptedPassword", "updatedAt"]
+    },
+    "WarmupThread": {
+      "title": "WarmupThread",
+      "description": "Tracks warm-up email threads by Message-ID without injecting artificial markers into subjects or bodies.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "messageId": { "type": "string", "minLength": 3, "maxLength": 512 },
+        "primaryMailboxId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "helperMailboxId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "helperEmail": { "type": "string", "format": "email", "minLength": 3, "maxLength": 254 },
+        "subject": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "bodySnippet": { "type": "string", "maxLength": 1000 },
+        "format": { "type": "string", "enum": ["plain", "light_html"] },
+        "usedFallback": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["sent", "replied", "failed"] },
+        "foundInSpam": { "type": "boolean" },
+        "sentAt": { "type": "string", "format": "date-time", "maxLength": 64 },
+        "repliedAt": { "type": "string", "maxLength": 64 },
+        "replyMessageId": { "type": "string", "maxLength": 512 }
+      },
+      "required": [
+        "ownerUid",
+        "messageId",
+        "primaryMailboxId",
+        "helperMailboxId",
+        "helperEmail",
+        "subject",
+        "format",
+        "usedFallback",
+        "status",
+        "foundInSpam",
+        "sentAt"
+      ]
+    },
+    "DailyStats": {
+      "title": "DailyStats",
+      "description": "Daily aggregated warm-up metrics keyed by YYYY-MM-DD in the configured timezone.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "dateKey": { "type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "dayIndex": { "type": "integer" },
+        "targetLimit": { "type": "integer" },
+        "sentCount": { "type": "integer" },
+        "repliedCount": { "type": "integer" },
+        "rescuedFromSpamCount": { "type": "integer" },
+        "fallbackCount": { "type": "integer" },
+        "errorCount": { "type": "integer" },
+        "updatedAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": [
+        "ownerUid",
+        "dateKey",
+        "dayIndex",
+        "targetLimit",
+        "sentCount",
+        "repliedCount",
+        "rescuedFromSpamCount",
+        "fallbackCount",
+        "errorCount",
+        "updatedAt"
+      ]
+    },
+    "WarmupLog": {
+      "title": "WarmupLog",
+      "description": "Sanitized operational log entry without passwords or raw secrets.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "level": { "type": "string", "enum": ["info", "warn", "error"] },
+        "category": { "type": "string", "enum": ["send", "imap", "reply", "ai", "cron", "auth", "test"] },
+        "message": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time", "maxLength": 64 }
+      },
+      "required": ["ownerUid", "level", "category", "message", "createdAt"]
+    },
+    "ExecutionLock": {
+      "title": "ExecutionLock",
+      "description": "Transactional TTL lock preventing overlapping warm-up ticks.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "lockedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "source": { "type": "string", "enum": ["cron", "manual"] },
+        "acquiredAtMs": { "type": "integer" },
+        "expiresAtMs": { "type": "integer" }
+      },
+      "required": ["ownerUid", "lockedBy", "source", "acquiredAtMs", "expiresAtMs"]
+    }
+  },
+  "firestore": {
+    "/system/ownership": {
+      "schema": { "$ref": "#/entities/Ownership" },
+      "description": "Singleton document storing the primary ownerUid and optional co-owner emails."
+    },
+    "/settings/warmup": {
+      "schema": { "$ref": "#/entities/WarmupSettings" },
+      "description": "Singleton warm-up schedule, format, and AI configuration document."
+    },
+    "/mailboxes/{mailboxId}": {
+      "schema": { "$ref": "#/entities/Mailbox" },
+      "description": "Primary and helper mailbox SMTP/IMAP configuration metadata."
+    },
+    "/mailbox_secrets/{mailboxId}": {
+      "schema": { "$ref": "#/entities/MailboxSecret" },
+      "description": "AES-256-GCM encrypted mailbox passwords."
+    },
+    "/threads/{threadId}": {
+      "schema": { "$ref": "#/entities/WarmupThread" },
+      "description": "Sent warm-up threads keyed by hash of Message-ID."
+    },
+    "/daily_stats/{dateKey}": {
+      "schema": { "$ref": "#/entities/DailyStats" },
+      "description": "Per-day warm-up counters in the configured timezone."
+    },
+    "/logs/{logId}": {
+      "schema": { "$ref": "#/entities/WarmupLog" },
+      "description": "Sanitized operational event logs."
+    },
+    "/locks/{lockId}": {
+      "schema": { "$ref": "#/entities/ExecutionLock" },
+      "description": "Transactional execution lock with 2-minute TTL."
+    }
+  }
+}
