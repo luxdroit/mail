@@ -28,9 +28,9 @@ import {
 import { testGeminiConnection, type GenAiCaller } from './contentService';
 import {
   createDefaultSettings,
-  fetchMetadataAccessToken,
   FirestorePermissionError,
   FirestoreRestStore,
+  resolveServerFirestoreAccessToken,
   type WarmupStore,
 } from './firestoreStore';
 import { RealMailTransportAdapter, type MailTransportAdapter } from './mailService';
@@ -131,9 +131,15 @@ function resolveAppUrl(req: Request, env: NodeJS.ProcessEnv): string {
   if (envUrl && envUrl !== 'MY_APP_URL') {
     return envUrl.replace(/\/+$/, '');
   }
-  const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
-  const host = (req.headers['x-forwarded-host'] as string) || req.get('host') || 'localhost:3000';
-  return `${proto}://${host}`.replace(/\/+$/, '');
+  const rawProto = String(req.headers['x-forwarded-proto'] ?? req.protocol ?? 'https')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const proto = rawProto === 'http' ? 'http' : 'https';
+  const rawHost = String(req.headers['x-forwarded-host'] ?? req.get('host') ?? 'localhost:3000')
+    .split(',')[0]
+    .trim();
+  return `${proto}://${rawHost}`.replace(/\/+$/, '');
 }
 
 function buildAllowedEmails(ownership: OwnershipDoc): string[] {
@@ -142,19 +148,20 @@ function buildAllowedEmails(ownership: OwnershipDoc): string[] {
 
 export function createApiApp(deps: ApiAppDependencies = {}): Express {
   const app = express();
+  app.set('trust proxy', true);
   app.use(express.json({ limit: '256kb' }));
 
   const verifyToken = deps.verifyToken ?? createFirebaseTokenVerifier();
   const createUserStore = deps.createUserStore ?? ((idToken: string) => new FirestoreRestStore(idToken));
+  const getEnv = deps.getEnv ?? (() => process.env);
   const createCronStore =
     deps.createCronStore ??
     (async () => {
-      const token = await fetchMetadataAccessToken();
+      const token = await resolveServerFirestoreAccessToken(getEnv());
       if (!token) return null;
       return new FirestoreRestStore(token);
     });
   const mailAdapter = deps.mailAdapter ?? new RealMailTransportAdapter();
-  const getEnv = deps.getEnv ?? (() => process.env);
 
   async function authenticateOwner(
     req: Request,
@@ -744,7 +751,7 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
     if (!store) {
       res.status(503).json({
         error:
-          'Brak tokenu konta serwisowego GCP (metadata server). Bezstanowy cron wymaga uruchomienia w Google Cloud Run na projekcie z nadaną rolą roles/datastore.user.',
+          'Brak poświadczeń konta serwisowego Firebase/GCP. Ustaw FIREBASE_SERVICE_ACCOUNT_JSON (lub GOOGLE_APPLICATION_CREDENTIALS) w pliku .env na własnym serwerze, albo nadaj rolę roles/datastore.user w Cloud Run.',
       });
       return;
     }

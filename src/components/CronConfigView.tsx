@@ -44,7 +44,7 @@ export function CronConfigView({ appUrl, secrets, activeLock }: CronConfigViewPr
               secrets.hasCronSecret ? 'text-emerald-700' : 'text-amber-700'
             }`}
           >
-            {secrets.hasCronSecret ? 'CRON_SECRET skonfigurowany' : 'Brak CRON_SECRET w Secrets'}
+            {secrets.hasCronSecret ? 'CRON_SECRET skonfigurowany' : 'Brak CRON_SECRET w .env'}
           </span>
         </div>
 
@@ -115,7 +115,7 @@ export function CronConfigView({ appUrl, secrets, activeLock }: CronConfigViewPr
 
         <p className="text-xs text-slate-500">
           Alternatywnie endpoint akceptuje nagłówek <span className="font-mono">x-cron-secret: &lt;CRON_SECRET&gt;</span>.
-          Zastąp <span className="font-mono">&lt;CRON_SECRET&gt;</span> wartością wklejoną do AI Studio Secrets.
+          Zastąp <span className="font-mono">&lt;CRON_SECRET&gt;</span> wartością ustawioną w zmiennych środowiskowych serwera (<span className="font-mono">.env</span>).
         </p>
 
         {/* Suggested Interval & Lock */}
@@ -166,15 +166,21 @@ export function CronConfigView({ appUrl, secrets, activeLock }: CronConfigViewPr
         </div>
       </section>
 
-      <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-2 text-xs text-slate-600 leading-relaxed">
+      <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-2.5 text-xs text-slate-600 leading-relaxed">
         <h3 className="text-sm font-semibold text-slate-900">
-          Wskazówka dla publikacji na Cloud Run (bezobsługowy Cron)
+          Samodzielny hosting i bezobsługowy Cron (VPS, Docker, Railway, Render, Cloud Run)
         </h3>
         <p>
-          Gdy publikujesz aplikację w Cloud Run na własnym projekcie Google Cloud, nadaj kontu
-          serwisowemu usługi Cloud Run rolę <span className="font-mono text-slate-900">roles/datastore.user</span>{' '}
-          w IAM, aby żądania z <span className="font-mono">cron-job.org</span> mogły odczytywać i
-          zapisywać stan w Firestore bez zalogowanej przeglądarki.
+          Na własnym serwerze (Docker, VPS, Railway, Render, Fly.io) dodaj w zmiennych środowiskowych
+          pliku <span className="font-mono text-slate-900">.env</span> klucz konta serwisowego
+          Firebase jako <span className="font-mono text-slate-900">FIREBASE_SERVICE_ACCOUNT_JSON</span>{' '}
+          (lub ścieżkę <span className="font-mono text-slate-900">GOOGLE_APPLICATION_CREDENTIALS</span>).
+          Dzięki temu <span className="font-mono">POST /api/cron/tick</span> działa całkowicie
+          niezależnie na dowolnym hostingu.
+        </p>
+        <p>
+          Przy wdrożeniu na Google Cloud Run wystarczy nadać kontu serwisowemu usługi rolę{' '}
+          <span className="font-mono text-slate-900">roles/datastore.user</span> w IAM.
         </p>
       </section>
     </div>

@@ -188,9 +188,12 @@ export function AiAndAccessView({
           )}
 
           <p className="text-xs text-slate-500 leading-relaxed">
-            W razie błędu limitu <span className="font-mono">429</span>, błędu sieci, nieobsługiwanego
-            modelu (<span className="font-mono">404</span>) lub braku klucza API, silnik automatycznie
-            przełączy się na wbudowaną pulę neutralnych szablonów konwersacyjnych i zapisze to w logach.
+            Klucz <span className="font-mono">GEMINI_API_KEY</span> jest odczytywany wyłącznie po
+            stronie serwera ze zmiennych środowiskowych (<span className="font-mono">.env</span> /
+            panel hostingu) — każda samodzielna instancja korzysta z własnego klucza bez przekazywania
+            go do przeglądarki. W razie błędu limitu <span className="font-mono">429</span>, błędu
+            sieci, nieobsługiwanego modelu (<span className="font-mono">404</span>) lub braku klucza,
+            silnik automatycznie przełączy się na wbudowaną pulę neutralnych szablonów konwersacyjnych.
           </p>
         </div>
 

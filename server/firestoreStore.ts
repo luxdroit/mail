@@ -173,17 +173,162 @@ export interface FirebaseAppletConfig {
 
 let cachedFirebaseConfig: FirebaseAppletConfig | null = null;
 
-export function loadFirebaseAppletConfig(): FirebaseAppletConfig {
+export function resetFirebaseConfigCache(): void {
+  cachedFirebaseConfig = null;
+}
+
+/**
+ * Loads Firebase project & Firestore database ID.
+ * Priority:
+ * 1. Server environment variables (FIREBASE_PROJECT_ID / FIREBASE_DATABASE_ID) for standalone deployments.
+ * 2. Bundled firebase-applet-config.json fallback.
+ */
+export function loadFirebaseAppletConfig(env: NodeJS.ProcessEnv = process.env): FirebaseAppletConfig {
+  const envProjectId = (env.FIREBASE_PROJECT_ID ?? env.VITE_FIREBASE_PROJECT_ID ?? '').trim();
+  if (envProjectId) {
+    const envDbId = (env.FIREBASE_DATABASE_ID ?? env.VITE_FIREBASE_DATABASE_ID ?? '').trim();
+    return {
+      projectId: envProjectId,
+      firestoreDatabaseId: envDbId || '(default)',
+    };
+  }
+
   if (cachedFirebaseConfig) return cachedFirebaseConfig;
   const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+  if (!fs.existsSync(configPath)) {
+    throw new Error(
+      'Brak konfiguracji Firebase: ustaw FIREBASE_PROJECT_ID w pliku .env (lub dodaj firebase-applet-config.json).'
+    );
+  }
   const raw = fs.readFileSync(configPath, 'utf8');
   cachedFirebaseConfig = JSON.parse(raw) as FirebaseAppletConfig;
   return cachedFirebaseConfig;
 }
 
+interface ServiceAccountKey {
+  client_email: string;
+  private_key: string;
+  token_uri?: string;
+}
+
+let cachedServiceAccountToken: { token: string; expiresAtMs: number } | null = null;
+
+export function resetServiceAccountTokenCache(): void {
+  cachedServiceAccountToken = null;
+}
+
+function parseServiceAccountFromEnv(env: NodeJS.ProcessEnv = process.env): ServiceAccountKey | null {
+  const inlineRaw = (env.FIREBASE_SERVICE_ACCOUNT_JSON ?? '').trim();
+  if (inlineRaw) {
+    const jsonText = inlineRaw.startsWith('{')
+      ? inlineRaw
+      : Buffer.from(inlineRaw, 'base64').toString('utf8');
+    const parsed = JSON.parse(jsonText) as Partial<ServiceAccountKey>;
+    if (parsed.client_email && parsed.private_key) {
+      return {
+        client_email: parsed.client_email,
+        private_key: parsed.private_key.replace(/\\n/g, '\n'),
+        token_uri: parsed.token_uri,
+      };
+    }
+  }
+
+  const credPath = (env.GOOGLE_APPLICATION_CREDENTIALS ?? '').trim();
+  if (credPath && fs.existsSync(credPath)) {
+    const parsed = JSON.parse(fs.readFileSync(credPath, 'utf8')) as Partial<ServiceAccountKey>;
+    if (parsed.client_email && parsed.private_key) {
+      return {
+        client_email: parsed.client_email,
+        private_key: parsed.private_key.replace(/\\n/g, '\n'),
+        token_uri: parsed.token_uri,
+      };
+    }
+  }
+
+  return null;
+}
+
+function base64UrlEncode(input: Buffer | string): string {
+  return Buffer.from(input)
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+/**
+ * Exchanges a Google Service Account JSON (from FIREBASE_SERVICE_ACCOUNT_JSON or
+ * GOOGLE_APPLICATION_CREDENTIALS) for a short-lived OAuth2 access token scoped to Firestore.
+ * Enables unattended POST /api/cron/tick on any standalone host (VPS, Docker, Railway, Render, Fly.io).
+ */
+export async function fetchServiceAccountAccessToken(
+  env: NodeJS.ProcessEnv = process.env
+): Promise<string | null> {
+  const nowMs = Date.now();
+  if (cachedServiceAccountToken && cachedServiceAccountToken.expiresAtMs - 60_000 > nowMs) {
+    return cachedServiceAccountToken.token;
+  }
+
+  let sa: ServiceAccountKey | null = null;
+  try {
+    sa = parseServiceAccountFromEnv(env);
+  } catch {
+    return null;
+  }
+  if (!sa) return null;
+
+  const iat = Math.floor(nowMs / 1000);
+  const exp = iat + 3600;
+  const tokenEndpoint = 'https://oauth2.googleapis.com/token';
+
+  const header = base64UrlEncode(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claimSet = base64UrlEncode(
+    JSON.stringify({
+      iss: sa.client_email,
+      scope: 'https://www.googleapis.com/auth/datastore',
+      aud: tokenEndpoint,
+      iat,
+      exp,
+    })
+  );
+
+  const signingInput = `${header}.${claimSet}`;
+  const signer = crypto.createSign('RSA-SHA256');
+  signer.update(signingInput);
+  signer.end();
+  const signature = base64UrlEncode(signer.sign(sa.private_key));
+  const assertion = `${signingInput}.${signature}`;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    const resp = await fetch(tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion,
+      }).toString(),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as { access_token?: string; expires_in?: number };
+    if (!data.access_token) return null;
+    const ttlSec = typeof data.expires_in === 'number' && data.expires_in > 120 ? data.expires_in : 3500;
+    cachedServiceAccountToken = {
+      token: data.access_token,
+      expiresAtMs: nowMs + ttlSec * 1000,
+    };
+    return data.access_token;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Obtains a Google Cloud Access Token from the Cloud Run / GCE Metadata server
- * for unattended server-to-Firestore calls (used exclusively by POST /api/cron/tick on user-owned projects).
+ * for unattended server-to-Firestore calls when running on GCP.
  */
 export async function fetchMetadataAccessToken(): Promise<string | null> {
   try {
@@ -203,6 +348,19 @@ export async function fetchMetadataAccessToken(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolves a server-side Firestore OAuth2 token for unattended POST /api/cron/tick:
+ * 1. Standalone Service Account (FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS).
+ * 2. Cloud Run / GCE Metadata Server fallback.
+ */
+export async function resolveServerFirestoreAccessToken(
+  env: NodeJS.ProcessEnv = process.env
+): Promise<string | null> {
+  const saToken = await fetchServiceAccountAccessToken(env);
+  if (saToken) return saToken;
+  return fetchMetadataAccessToken();
 }
 
 export class FirestoreRestStore implements WarmupStore {

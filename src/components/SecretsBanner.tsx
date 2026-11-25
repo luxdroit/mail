@@ -54,13 +54,15 @@ export function SecretsBanner({ secrets }: SecretsBannerProps) {
           <div className="flex items-center gap-2 text-amber-900">
             <AlertTriangle className="w-4 h-4 shrink-0 text-amber-700" />
             <h2 className="text-sm font-semibold">
-              Wymagana konfiguracja zmiennych środowiskowych w AI Studio Secrets
+              Wymagana konfiguracja zmiennych środowiskowych serwera (.env)
             </h2>
           </div>
           <p className="text-xs text-amber-900/90 leading-relaxed max-w-3xl">
-            Otwórz zakładkę <strong>Settings &rarr; Secrets</strong> i dodaj brakujące zmienne, a
-            następnie zrestartuj serwer. Wartości wygenerowane poniżej powstają lokalnie w Twojej
-            przeglądarce (Web Crypto API) i nie są nigdzie zapisywane ani wysyłane.
+            Dodaj brakujące zmienne w pliku <strong className="font-mono">.env</strong> lub w
+            ustawieniach zmiennych środowiskowych swojego hostingu (np. Docker, VPS, Railway,
+            Render, Cloud Run), a następnie zrestartuj serwer. Wartości wygenerowane poniżej
+            powstają lokalnie w Twojej przeglądarce (Web Crypto API) i nie są nigdzie zapisywane ani
+            wysyłane.
           </p>
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-amber-900 pt-1">
             {needsEncryption && (

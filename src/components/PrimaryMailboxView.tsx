@@ -269,7 +269,8 @@ export function PrimaryMailboxView({
         {!encryptionReady && (
           <div className="p-3 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-900">
             Uwaga: najpierw ustaw poprawny 32-bajtowy <span className="font-mono">ENCRYPTION_KEY</span> w
-            AI Studio Secrets, aby zapisać zaszyfrowane hasło skrzynki.
+            zmiennych środowiskowych serwera (<span className="font-mono">.env</span>), aby zapisać
+            zaszyfrowane hasło skrzynki.
           </div>
         )}
 

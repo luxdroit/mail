@@ -49,7 +49,7 @@ export function verifyCronAuthorization(
     return {
       ok: false,
       status: 503,
-      error: 'CRON_SECRET nie jest ustawiony w zmiennych środowiskowych (Secrets).',
+      error: 'CRON_SECRET nie jest ustawiony w zmiennych środowiskowych serwera (.env).',
     };
   }
 

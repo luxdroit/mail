@@ -283,7 +283,8 @@ export async function testGeminiConnection(options: {
       latencyMs: Date.now() - started,
       fallbackReady: true,
       status: 'fallback_missing_key',
-      message: 'Brak GEMINI_API_KEY w Secrets — silnik będzie korzystał z wbudowanej puli szablonów (fallback).',
+      message:
+        'Brak GEMINI_API_KEY w zmiennych środowiskowych serwera (.env) — silnik będzie korzystał z wbudowanej puli szablonów (fallback).',
     };
   }
 

@@ -1,6 +1,13 @@
+import crypto from 'node:crypto';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { FirestoreRestStore } from './firestoreStore';
+import {
+  fetchServiceAccountAccessToken,
+  FirestoreRestStore,
+  loadFirebaseAppletConfig,
+  resetFirebaseConfigCache,
+  resetServiceAccountTokenCache,
+} from './firestoreStore';
 
 interface MockFetchCall {
   url: string;
@@ -203,6 +210,69 @@ describe('FirestoreRestStore lock concurrency (REST preconditions, no :beginTran
       assert.ok(calls[1].url.includes('currentDocument.updateTime=2026-11-25T18%3A05%3A00.500000Z'));
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe('Standalone Firebase config and Service Account OAuth2 token resolution', () => {
+  it('prioritizes FIREBASE_PROJECT_ID and FIREBASE_DATABASE_ID env vars over bundled json', () => {
+    resetFirebaseConfigCache();
+    const cfg = loadFirebaseAppletConfig({
+      FIREBASE_PROJECT_ID: 'my-standalone-project',
+      FIREBASE_DATABASE_ID: 'custom-db',
+    });
+    assert.equal(cfg.projectId, 'my-standalone-project');
+    assert.equal(cfg.firestoreDatabaseId, 'custom-db');
+
+    const cfgDefaultDb = loadFirebaseAppletConfig({
+      FIREBASE_PROJECT_ID: 'another-project',
+    });
+    assert.equal(cfgDefaultDb.projectId, 'another-project');
+    assert.equal(cfgDefaultDb.firestoreDatabaseId, '(default)');
+  });
+
+  it('signs an RS256 JWT assertion from FIREBASE_SERVICE_ACCOUNT_JSON and caches the OAuth2 access token', async () => {
+    resetServiceAccountTokenCache();
+    const { privateKey } = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+    });
+
+    const saJson = JSON.stringify({
+      client_email: 'warmup-cron@my-standalone-project.iam.gserviceaccount.com',
+      private_key: privateKey,
+    });
+
+    const originalFetch = globalThis.fetch;
+    let tokenCalls = 0;
+
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      assert.equal(url, 'https://oauth2.googleapis.com/token');
+      assert.equal(init?.method, 'POST');
+      const bodyStr = String(init?.body ?? '');
+      assert.ok(bodyStr.includes('grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer'));
+      assert.ok(bodyStr.includes('assertion='));
+      tokenCalls += 1;
+      return new Response(JSON.stringify({ access_token: 'ya29.test-standalone-token', expires_in: 3600 }), {
+        status: 200,
+      });
+    }) as typeof fetch;
+
+    try {
+      const token1 = await fetchServiceAccountAccessToken({
+        FIREBASE_SERVICE_ACCOUNT_JSON: Buffer.from(saJson, 'utf8').toString('base64'),
+      });
+      const token2 = await fetchServiceAccountAccessToken({
+        FIREBASE_SERVICE_ACCOUNT_JSON: saJson,
+      });
+      assert.equal(token1, 'ya29.test-standalone-token');
+      assert.equal(token2, 'ya29.test-standalone-token');
+      assert.equal(tokenCalls, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      resetServiceAccountTokenCache();
     }
   });
 });
