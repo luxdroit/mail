@@ -90,6 +90,8 @@ export function createDefaultSettings(ownerUid: string, allowedEmails: string[],
     timezone: DEFAULT_TIMEZONE,
     messageFormat: 'plain',
     aiModel: DEFAULT_AI_MODEL,
+    hasCustomAiKey: false,
+    encryptedGeminiApiKey: '',
     lastSentAt: '',
     nextAllowedSendAt: '',
     lastHelperIndex: 0,
@@ -261,11 +263,6 @@ function base64UrlEncode(input: Buffer | string): string {
     .replace(/\//g, '_');
 }
 
-/**
- * Exchanges a Google Service Account JSON (from FIREBASE_SERVICE_ACCOUNT_JSON or
- * GOOGLE_APPLICATION_CREDENTIALS) for a short-lived OAuth2 access token scoped to Firestore.
- * Enables unattended POST /api/cron/tick on any standalone host (VPS, Docker, Railway, Render, Fly.io).
- */
 export async function fetchServiceAccountAccessToken(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<string | null> {
@@ -331,10 +328,6 @@ export async function fetchServiceAccountAccessToken(
   }
 }
 
-/**
- * Obtains a Google Cloud Access Token from the Cloud Run / GCE Metadata server
- * for unattended server-to-Firestore calls when running on GCP.
- */
 export async function fetchMetadataAccessToken(): Promise<string | null> {
   try {
     const controller = new AbortController();
@@ -355,11 +348,6 @@ export async function fetchMetadataAccessToken(): Promise<string | null> {
   }
 }
 
-/**
- * Resolves a server-side Firestore OAuth2 token for unattended POST /api/cron/tick:
- * 1. Standalone Service Account (FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS).
- * 2. Cloud Run / GCE Metadata Server fallback.
- */
 export async function resolveServerFirestoreAccessToken(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<string | null> {
@@ -632,6 +620,8 @@ export class FirestoreRestStore implements WarmupStore {
       ...settings,
       lastSentAt: settings.lastSentAt ?? '',
       nextAllowedSendAt: settings.nextAllowedSendAt ?? '',
+      encryptedGeminiApiKey: settings.encryptedGeminiApiKey ?? '',
+      hasCustomAiKey: Boolean(settings.encryptedGeminiApiKey),
     });
   }
 
@@ -773,9 +763,6 @@ export class FirestoreRestStore implements WarmupStore {
     const safeNowMs = Math.trunc(nowMs);
     const safeExpiresAtMs = Math.trunc(nowMs + ttlMs);
 
-    // Atomic optimistic concurrency (Compare-And-Swap) using Firestore REST
-    // currentDocument preconditions (exists=false / updateTime). Works with both
-    // Firebase Auth user ID tokens (manual UI runs) and Cloud Run IAM tokens (cron).
     for (let attempt = 0; attempt < 3; attempt++) {
       const existing = await this.getDocWithMeta<ExecutionLock>(docPath);
 
@@ -820,7 +807,6 @@ export class FirestoreRestStore implements WarmupStore {
         resp.status === 409 ||
         (resp.status === 400 && (txt.includes('FAILED_PRECONDITION') || txt.includes('ALREADY_EXISTS')))
       ) {
-        // Another concurrent caller updated or created the lock first — retry to observe active lock
         continue;
       }
 
@@ -859,9 +845,6 @@ export class FirestoreRestStore implements WarmupStore {
   }
 }
 
-/**
- * Deterministic in-memory store with atomic lock semantics used for unit & integration tests.
- */
 export class InMemoryWarmupStore implements WarmupStore {
   ownership: OwnershipDoc | null = null;
   runtimeSecrets: RuntimeSecretsDoc | null = null;
@@ -909,7 +892,7 @@ export class InMemoryWarmupStore implements WarmupStore {
   }
 
   async saveSettings(settings: WarmupSettings): Promise<void> {
-    this.settings = { ...settings };
+    this.settings = { ...settings, hasCustomAiKey: Boolean(settings.encryptedGeminiApiKey) };
   }
 
   async listMailboxes(): Promise<MailboxPublic[]> {

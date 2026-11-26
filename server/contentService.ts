@@ -271,10 +271,11 @@ export async function generateContextualReply(options: {
 export async function testGeminiConnection(options: {
   model?: string;
   caller?: GenAiCaller | null;
+  apiKey?: string;
 }): Promise<AiTestResult> {
   const model = (options.model || DEFAULT_AI_MODEL).trim();
   const started = Date.now();
-  const caller = options.caller !== undefined ? options.caller : createDefaultGenAiCaller();
+  const caller = options.caller !== undefined ? options.caller : createDefaultGenAiCaller(options.apiKey);
 
   if (!caller) {
     return {
@@ -284,7 +285,7 @@ export async function testGeminiConnection(options: {
       fallbackReady: true,
       status: 'fallback_missing_key',
       message:
-        'Brak GEMINI_API_KEY w zmiennych środowiskowych serwera (.env) — silnik będzie korzystał z wbudowanej puli szablonów (fallback).',
+        'Brak klucza Gemini API — podaj swój klucz w formularzu w zakładce AI lub ustaw GEMINI_API_KEY w serwerze.',
     };
   }
 

@@ -27,7 +27,7 @@ import {
   sanitizeForLogs,
   validateEncryptionKeyStatus,
 } from './crypto';
-import { testGeminiConnection, type GenAiCaller } from './contentService';
+import { createDefaultGenAiCaller, testGeminiConnection, type GenAiCaller } from './contentService';
 import {
   createDefaultSettings,
   FirestorePermissionError,
@@ -159,20 +159,22 @@ interface ResolvedWorkspaceSecrets {
 /**
  * Ensures every workspace (both root and personal per-user workspaces) has auto-generated
  * AES-256-GCM encryption key and Cron bearer token persisted in Firestore.
- *
- * - On the root workspace, valid server env vars (ENCRYPTION_KEY / CRON_SECRET) still take
- *   precedence so existing deployments keep decrypting previously saved mailboxes seamlessly.
- * - On personal workspaces (/users/{uid}/...), keys are ALWAYS isolated and auto-generated per user.
- * - encryptionKey is NEVER returned to the browser; cronTokenForUi is returned only when auto-managed.
  */
 async function ensureWorkspaceRuntimeSecrets(
   store: WarmupStore,
   ownerUid: string,
   isPersonalWorkspace: boolean,
-  env: NodeJS.ProcessEnv
+  env: NodeJS.ProcessEnv,
+  hasCustomAiKey = false
 ): Promise<ResolvedWorkspaceSecrets> {
-  const geminiKey = (env.GEMINI_API_KEY ?? '').trim();
-  const hasGeminiKey = Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY');
+  const envGeminiKey = (env.GEMINI_API_KEY ?? '').trim();
+  const hasEnvGeminiKey = Boolean(envGeminiKey && envGeminiKey !== 'MY_GEMINI_API_KEY');
+  const hasGeminiKey = hasCustomAiKey || hasEnvGeminiKey;
+  const geminiKeySource: 'workspace' | 'env' | 'missing' = hasCustomAiKey
+    ? 'workspace'
+    : hasEnvGeminiKey
+      ? 'env'
+      : 'missing';
 
   let doc = await store.getRuntimeSecrets();
   if (!doc) {
@@ -206,6 +208,7 @@ async function ensureWorkspaceRuntimeSecrets(
         hasCronSecret: Boolean(cronSecret && cronSecret.length >= 16),
         cronSecretSource: cronSecret && cronSecret.length >= 16 ? 'auto' : 'missing',
         hasGeminiKey,
+        geminiKeySource,
       },
     };
   }
@@ -240,7 +243,6 @@ async function ensureWorkspaceRuntimeSecrets(
   if (envCron.length >= 16) {
     cronSecret = envCron;
     cronSecretSource = 'env';
-    // Do not expose server .env secret in browser responses
     cronTokenForUi = undefined;
   } else if (doc?.cronSecret && doc.cronSecret.length >= 16) {
     cronSecret = doc.cronSecret;
@@ -260,6 +262,7 @@ async function ensureWorkspaceRuntimeSecrets(
       hasCronSecret: Boolean(cronSecret && cronSecret.length >= 16),
       cronSecretSource,
       hasGeminiKey,
+      geminiKeySource,
     },
   };
 }
@@ -368,7 +371,6 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
         rootOwnership = await rootStore.getOwnership();
       } catch (err) {
         if (err instanceof FirestorePermissionError) {
-          // Another Google account already owns the root workspace — route cleanly to this user's isolated space
           rootDenied = true;
         } else {
           throw err;
@@ -408,7 +410,6 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
             isPersonalWorkspace: false,
           };
         }
-        // Lost initial claim race — fall through to isolated personal workspace
         rootDenied = true;
       }
 
@@ -428,7 +429,6 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
         }
       }
 
-      // User is not the root owner or co-owner -> route to their strictly isolated personal workspace (/users/{uid}/...)
       const personalCtx = await initPersonalWorkspace(user, idToken, Boolean(options.allowInitialClaim));
       if (!personalCtx) {
         res.status(403).json({
@@ -462,11 +462,14 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
 
     const { user, store, ownership, workspaceId, isPersonalWorkspace } = authCtx;
     try {
+      const settings = await store.getSettings();
+      const hasCustomAiKey = Boolean(settings?.encryptedGeminiApiKey);
       const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
         store,
         ownership.ownerUid,
         isPersonalWorkspace,
-        getEnv()
+        getEnv(),
+        hasCustomAiKey
       );
       const payload: SessionResponse = {
         uid: user.uid,
@@ -498,11 +501,13 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
         await store.saveSettings(settings);
       }
 
+      const hasCustomAiKey = Boolean(settings.encryptedGeminiApiKey && settings.encryptedGeminiApiKey.length > 0);
       const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
         store,
         ownership.ownerUid,
         isPersonalWorkspace,
-        env
+        env,
+        hasCustomAiKey
       );
 
       const now = new Date();
@@ -533,11 +538,14 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
 
       const validLock = activeLock && activeLock.expiresAtMs > Date.now() ? activeLock : null;
 
+      const { encryptedGeminiApiKey: _, ...clientSettings } = settings;
+      clientSettings.hasCustomAiKey = hasCustomAiKey;
+
       const payload: DashboardPayload = {
         ownership,
         workspaceId,
         isPersonalWorkspace,
-        settings,
+        settings: clientSettings as WarmupSettings,
         todayStats,
         computedSchedule: {
           dateKey: zoned.dateKey,
@@ -569,7 +577,9 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
     const env = getEnv();
 
     try {
-      const current = await ensureWorkspaceRuntimeSecrets(store, ownership.ownerUid, isPersonalWorkspace, env);
+      const settings = await store.getSettings();
+      const hasCustomAiKey = Boolean(settings?.encryptedGeminiApiKey);
+      const current = await ensureWorkspaceRuntimeSecrets(store, ownership.ownerUid, isPersonalWorkspace, env, hasCustomAiKey);
       if (current.status.cronSecretSource === 'env') {
         res.status(400).json({
           error:
@@ -696,6 +706,33 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
         return;
       }
 
+      // Szyfrowanie lub usunięcie klucza Gemini użytkownika
+      let encryptedGeminiApiKey = existing.encryptedGeminiApiKey;
+      if (body.geminiApiKey !== undefined) {
+        const rawApiKey = typeof body.geminiApiKey === 'string' ? body.geminiApiKey.trim() : '';
+        if (rawApiKey === '') {
+          encryptedGeminiApiKey = undefined;
+        } else {
+          const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
+            store,
+            currentOwnership.ownerUid,
+            isPersonalWorkspace,
+            getEnv(),
+            Boolean(existing.encryptedGeminiApiKey)
+          );
+          try {
+            encryptedGeminiApiKey = encryptSecret(rawApiKey, resolvedSecrets.encryptionKey);
+          } catch (err) {
+            if (err instanceof EncryptionKeyError) {
+              res.status(400).json({ error: err.message });
+              return;
+            }
+            res.status(500).json({ error: 'Błąd szyfrowania klucza API Gemini.' });
+            return;
+          }
+        }
+      }
+
       const updated: WarmupSettings = {
         ...existing,
         ownerUid: currentOwnership.ownerUid,
@@ -712,12 +749,13 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
         timezone,
         messageFormat,
         aiModel,
+        encryptedGeminiApiKey,
+        hasCustomAiKey: Boolean(encryptedGeminiApiKey),
         updatedAt: new Date().toISOString(),
       };
 
       await store.saveSettings(updated);
 
-      // Keep mailbox allowedEmails synced if co-owners changed
       if (Array.isArray(body.coOwnerEmails)) {
         const boxes = await store.listMailboxes(currentOwnership.ownerUid, user.uid, user.email);
         for (const box of boxes) {
@@ -725,7 +763,8 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
         }
       }
 
-      res.json({ settings: updated, ownership: currentOwnership });
+      const { encryptedGeminiApiKey: _, ...safeSettings } = updated;
+      res.json({ settings: safeSettings, ownership: currentOwnership });
     } catch (err) {
       res.status(500).json({ error: sanitizeForLogs(err instanceof Error ? err.message : String(err)) });
     }
@@ -736,14 +775,36 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
     const authCtx = await authenticateWorkspace(req, res);
     if (!authCtx) return;
 
-    const { store, ownership } = authCtx;
+    const { store, ownership, isPersonalWorkspace } = authCtx;
     const requestedModel = typeof req.body?.model === 'string' ? req.body.model.trim() : undefined;
+    const requestedApiKey = typeof req.body?.apiKey === 'string' ? req.body.apiKey.trim() : undefined;
     const settings = await store.getSettings();
     const model = requestedModel || settings?.aiModel;
 
+    let effectiveApiKey = requestedApiKey;
+    if (!effectiveApiKey && settings?.encryptedGeminiApiKey) {
+      try {
+        const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
+          store,
+          ownership.ownerUid,
+          isPersonalWorkspace,
+          getEnv(),
+          true
+        );
+        effectiveApiKey = decryptSecret(settings.encryptedGeminiApiKey, resolvedSecrets.encryptionKey);
+      } catch {
+        // fallback
+      }
+    }
+
+    const testCaller = deps.aiCaller !== undefined
+      ? deps.aiCaller
+      : (effectiveApiKey ? createDefaultGenAiCaller(effectiveApiKey) : undefined);
+
     const result = await testGeminiConnection({
       model,
-      caller: deps.aiCaller,
+      caller: testCaller,
+      apiKey: effectiveApiKey,
     });
 
     await store.appendLog({
@@ -751,7 +812,7 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
       allowedEmails: buildAllowedEmails(ownership),
       level: result.ok ? 'info' : 'warn',
       category: 'ai',
-      message: sanitizeForLogs(`Test Gemini (${result.model}): ${result.message}`),
+      message: sanitizeForLogs(`Test Gemini (${result.model}): ${result.message}`, [effectiveApiKey || '']),
       createdAt: new Date().toISOString(),
     });
 
@@ -1002,11 +1063,14 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
     const bypassWindowAndDelay = Boolean(req.body?.bypassWindowAndDelay);
 
     try {
+      const settings = await store.getSettings();
+      const hasCustomAiKey = Boolean(settings?.encryptedGeminiApiKey);
       const resolvedSecrets = await ensureWorkspaceRuntimeSecrets(
         store,
         ownership.ownerUid,
         isPersonalWorkspace,
-        getEnv()
+        getEnv(),
+        hasCustomAiKey
       );
       const result = await executeWarmupCycle({
         store,
@@ -1044,7 +1108,6 @@ export function createApiApp(deps: ApiAppDependencies = {}): Express {
     const workspacePrefix = isPersonalWorkspace ? `users/${workspaceParam}` : '';
     const envCronSecret = (env.CRON_SECRET ?? '').trim();
 
-    // Fast fail on root workspace when server env CRON_SECRET is explicitly set
     if (!isPersonalWorkspace && envCronSecret.length >= 16) {
       const envCheck = verifyCronAuthorization(
         {

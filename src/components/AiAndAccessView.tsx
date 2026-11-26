@@ -1,5 +1,15 @@
 import { useEffect, useState } from 'react';
-import { CheckCircle2, KeyRound, Plus, Sparkles, Trash2, Users, AlertTriangle } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Plus,
+  Sparkles,
+  Trash2,
+  Users,
+} from 'lucide-react';
 import {
   RECOMMENDED_AI_MODELS,
   type AiTestResult,
@@ -14,7 +24,7 @@ interface AiAndAccessViewProps {
   isPrimaryOwner: boolean;
   isPersonalWorkspace: boolean;
   secrets: SecretsStatus;
-  onSaveSettings: (patch: Partial<WarmupSettings> & { coOwnerEmails?: string[] }) => Promise<void>;
+  onSaveSettings: (patch: Partial<WarmupSettings> & { coOwnerEmails?: string[]; geminiApiKey?: string }) => Promise<void>;
   onTestAi: (model: string) => Promise<AiTestResult>;
 }
 
@@ -30,6 +40,9 @@ export function AiAndAccessView({
   const isPreset = RECOMMENDED_AI_MODELS.some((m) => m.id === settings.aiModel);
   const [selectedModel, setSelectedModel] = useState(isPreset ? settings.aiModel : '__custom__');
   const [customModel, setCustomModel] = useState(isPreset ? '' : settings.aiModel);
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [showApiKey, setShowApiKey] = useState(false);
+
   const [savingAi, setSavingAi] = useState(false);
   const [testingAi, setTestingAi] = useState(false);
   const [aiResult, setAiResult] = useState<AiTestResult | null>(null);
@@ -38,9 +51,7 @@ export function AiAndAccessView({
   const [coOwners, setCoOwners] = useState<string[]>(ownership.coOwnerEmails);
   const [newCoOwner, setNewCoOwner] = useState('');
   const [savingAccess, setSavingAccess] = useState(false);
-  const [accessMessage, setAccessMessage] = useState<{ type: 'ok' | 'error'; text: string } | null>(
-    null
-  );
+  const [accessMessage, setAccessMessage] = useState<{ type: 'ok' | 'error'; text: string } | null>(null);
 
   useEffect(() => {
     const presetMatch = RECOMMENDED_AI_MODELS.some((m) => m.id === settings.aiModel);
@@ -63,12 +74,36 @@ export function AiAndAccessView({
     setSavingAi(true);
     setAiMessage(null);
     try {
-      await onSaveSettings({ aiModel: effectiveModel });
-      setAiMessage({ type: 'ok', text: `Zapisano model AI: ${effectiveModel}.` });
+      const patch: Partial<WarmupSettings> & { geminiApiKey?: string } = {
+        aiModel: effectiveModel,
+      };
+      if (apiKeyInput.trim()) {
+        patch.geminiApiKey = apiKeyInput.trim();
+      }
+      await onSaveSettings(patch);
+      setApiKeyInput('');
+      setAiMessage({ type: 'ok', text: `Zapisano konfigurację AI (${effectiveModel}).` });
     } catch (err) {
       setAiMessage({
         type: 'error',
-        text: err instanceof Error ? err.message : 'Nie udało się zapisać modelu AI.',
+        text: err instanceof Error ? err.message : 'Nie udało się zapisać ustawień AI.',
+      });
+    } finally {
+      setSavingAi(false);
+    }
+  };
+
+  const handleRemoveApiKey = async () => {
+    setSavingAi(true);
+    setAiMessage(null);
+    try {
+      await onSaveSettings({ geminiApiKey: '' });
+      setApiKeyInput('');
+      setAiMessage({ type: 'ok', text: 'Usunięto własny klucz API. Przywrócono tryb domyślny.' });
+    } catch (err) {
+      setAiMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Nie udało się usunąć klucza.',
       });
     } finally {
       setSavingAi(false);
@@ -80,6 +115,10 @@ export function AiAndAccessView({
     setAiResult(null);
     setAiMessage(null);
     try {
+      if (apiKeyInput.trim()) {
+        await onSaveSettings({ geminiApiKey: apiKeyInput.trim(), aiModel: effectiveModel });
+        setApiKeyInput('');
+      }
       const res = await onTestAi(effectiveModel || settings.aiModel);
       setAiResult(res);
     } catch (err) {
@@ -136,17 +175,16 @@ export function AiAndAccessView({
 
   return (
     <div className="max-w-3xl space-y-6">
-      {/* Automatic Security Keys Summary */}
+      {/* Automatyczne klucze */}
       <section className="bg-white border border-slate-200 rounded-lg p-6 space-y-4">
         <div className="flex items-center gap-2 pb-3 border-b border-slate-100">
           <KeyRound className="w-4 h-4 text-blue-700" />
           <div>
             <h2 className="text-base font-semibold text-slate-900">
-              Automatyczne klucze bezpieczeństwa
+              Klucze bezpieczeństwa i AI
             </h2>
             <p className="text-xs text-slate-500">
-              Klucz szyfrowania haseł i token Cron są generowane automatycznie dla Twojego konta —
-              bez ręcznego ustawiania zmiennych środowiskowych.
+              Klucz szyfrowania haseł i token Cron są generowane automatycznie dla Twojego konta.
             </p>
           </div>
         </div>
@@ -174,33 +212,39 @@ export function AiAndAccessView({
           </div>
           <div className="p-3 bg-slate-50 border border-slate-200 rounded-md space-y-1">
             <dt className="text-slate-500">Silnik treści AI (Gemini)</dt>
-            <dd className={`font-medium ${secrets.hasGeminiKey ? 'text-emerald-700' : 'text-amber-700'}`}>
-              {secrets.hasGeminiKey ? 'Połączony (klucz serwera)' : 'Wbudowane szablony (fallback)'}
+            <dd className={`font-medium ${settings.hasCustomAiKey || secrets.hasGeminiKey ? 'text-emerald-700' : 'text-amber-700'}`}>
+              {settings.hasCustomAiKey
+                ? 'Własny klucz użytkownika'
+                : secrets.hasGeminiKey
+                  ? 'Współdzielony klucz serwera'
+                  : 'Wbudowane szablony (fallback)'}
             </dd>
           </div>
         </dl>
       </section>
 
-      {/* Gemini AI Config */}
+      {/* Konfiguracja Gemini AI i własnego klucza */}
       <form
         onSubmit={handleSaveModel}
         className="bg-white border border-slate-200 rounded-lg p-6 space-y-5"
       >
         <div className="flex flex-wrap items-start justify-between gap-3 pb-4 border-b border-slate-100">
           <div>
-            <h2 className="text-base font-semibold text-slate-900">Konfiguracja Gemini AI i fallback</h2>
+            <h2 className="text-base font-semibold text-slate-900">Konfiguracja Google Gemini AI</h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Generowanie naturalnych konwersacji B2B i odpowiedzi po stronie serwera (@google/genai).
+              Generowanie unikalnych maili i odpowiedzi na Twoim własnym kluczu API z Google AI Studio.
             </p>
           </div>
           <span
             className={`text-xs font-medium ${
-              secrets.hasGeminiKey ? 'text-emerald-700' : 'text-amber-700'
+              settings.hasCustomAiKey || secrets.hasGeminiKey ? 'text-emerald-700' : 'text-amber-700'
             }`}
           >
-            {secrets.hasGeminiKey
-              ? 'Klucz AI serwera aktywny · Fallback gotowy'
-              : 'Tryb fallback aktywny (wbudowane szablony)'}
+            {settings.hasCustomAiKey
+              ? 'Własny klucz aktywny (AES-256)'
+              : secrets.hasGeminiKey
+                ? 'Klucz serwera aktywny'
+                : 'Brak klucza (aktywne szablony fallback)'}
           </span>
         </div>
 
@@ -234,12 +278,48 @@ export function AiAndAccessView({
             </label>
           )}
 
-          <p className="text-xs text-slate-500 leading-relaxed">
-            Połączenie z Gemini AI jest obsługiwane automatycznie po stronie serwera. W razie braku
-            klucza po stronie serwera, przekroczenia limitu (<span className="font-mono">429</span>)
-            lub błędu sieci, silnik automatycznie korzysta z wbudowanej puli naturalnych szablonów
-            konwersacyjnych.
-          </p>
+          {/* Własny klucz API */}
+          <div className="space-y-1.5 pt-2">
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-medium text-slate-700">
+                Twój klucz API Google Gemini (AI Studio)
+              </label>
+              {settings.hasCustomAiKey && (
+                <button
+                  type="button"
+                  onClick={() => void handleRemoveApiKey()}
+                  disabled={savingAi}
+                  className="text-xs text-red-600 hover:text-red-800 transition-colors"
+                >
+                  Usuń zapisany klucz
+                </button>
+              )}
+            </div>
+
+            <div className="relative">
+              <input
+                type={showApiKey ? 'text' : 'password'}
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                placeholder={
+                  settings.hasCustomAiKey
+                    ? '•••••••••••••••••••••••••••••••••••• (Klucz zapisany — wpisz nowy, aby podmienić)'
+                    : 'Wklej klucz (np. AIzaSy...)'
+                }
+                className="w-full pr-10 px-3 py-2 text-sm font-mono bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-700"
+              />
+              <button
+                type="button"
+                onClick={() => setShowApiKey(!showApiKey)}
+                className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-600"
+              >
+                {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+            <p className="text-xs text-slate-500">
+              Klucz uzyskasz na <strong>aistudio.google.com</strong>. Jest on szyfrowany i zapisywany w Twoim profilu.
+            </p>
+          </div>
         </div>
 
         {aiMessage && (
@@ -277,7 +357,7 @@ export function AiAndAccessView({
             <p>{aiResult.message}</p>
             {aiResult.sampleSubject && (
               <p className="text-slate-700 pt-1">
-                Przykładowy temat: <span className="font-medium">{aiResult.sampleSubject}</span>
+                Przykładowy wygenerowany temat: <span className="font-medium">{aiResult.sampleSubject}</span>
               </p>
             )}
           </div>
@@ -291,7 +371,7 @@ export function AiAndAccessView({
             className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
           >
             <Sparkles className="w-4 h-4" />
-            {testingAi ? 'Testowanie Gemini...' : 'Testuj połączenie z Gemini API'}
+            {testingAi ? 'Testowanie Gemini...' : 'Testuj połączenie'}
           </button>
 
           <button
@@ -299,12 +379,12 @@ export function AiAndAccessView({
             disabled={savingAi}
             className="px-4 py-2 text-sm font-medium text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
           >
-            {savingAi ? 'Zapisywanie...' : 'Zapisz model'}
+            {savingAi ? 'Zapisywanie...' : 'Zapisz ustawienia AI'}
           </button>
         </div>
       </form>
 
-      {/* Workspace Access Management */}
+      {/* Dostęp do przestrzeni roboczej */}
       {isPersonalWorkspace ? (
         <section className="bg-white border border-slate-200 rounded-lg p-6 space-y-3">
           <div className="flex items-center gap-2 pb-3 border-b border-slate-100">
@@ -314,7 +394,7 @@ export function AiAndAccessView({
                 Twoja prywatna przestrzeń robocza
               </h2>
               <p className="text-xs text-slate-500">
-                Wszystkie Twoje skrzynki, hasła, harmonogram, logi i token Cron są w pełni
+                Wszystkie Twoje skrzynki, hasła, klucz AI, harmonogram i token Cron są w pełni
                 odizolowane od innych użytkowników.
               </p>
             </div>
@@ -335,8 +415,7 @@ export function AiAndAccessView({
                 Właściciel i współwłaściciele przestrzeni głównej
               </h2>
               <p className="text-xs text-slate-500">
-                Dodani współwłaściciele współdzielą tę przestrzeń. Wszystkie inne konta Google po
-                zalogowaniu automatycznie otrzymują własną, odizolowaną przestrzeń roboczą.
+                Dodani współwłaściciele współdzielą tę przestrzeń i jej ustawienia.
               </p>
             </div>
           </div>
@@ -387,7 +466,7 @@ export function AiAndAccessView({
             </span>
             {coOwners.length === 0 ? (
               <p className="text-xs text-slate-500">
-                Brak dodanych współwłaścicieli — tę przestrzeń obsługuje wyłącznie Twoje konto.
+                Brak dodanych współwłaścicieli.
               </p>
             ) : (
               <ul className="divide-y divide-slate-100 border border-slate-200 rounded-md">

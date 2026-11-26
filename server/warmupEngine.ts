@@ -8,6 +8,7 @@ import {
   getZonedParts,
 } from './schedule';
 import {
+  createDefaultGenAiCaller,
   generateContextualReply,
   generateInitialWarmupEmail,
   type GenAiCaller,
@@ -113,6 +114,28 @@ export async function executeWarmupCycle(options: ExecuteWarmupOptions): Promise
       settings = createDefaultSettings(ownership.ownerUid, allowedEmails, now);
       await options.store.saveSettings(settings);
     }
+
+    // Dynamiczne odszyfrowanie dedykowanego klucza Gemini danego konta
+    let workspaceApiKey: string | undefined;
+    if (settings.encryptedGeminiApiKey && options.encryptionKey) {
+      try {
+        workspaceApiKey = decryptSecret(settings.encryptedGeminiApiKey, options.encryptionKey);
+      } catch {
+        await options.store.appendLog({
+          ownerUid: ownership.ownerUid,
+          allowedEmails,
+          level: 'warn',
+          category: 'ai',
+          message: 'Błąd odszyfrowania klucza Gemini API — nastąpi próba użycia klucza systemowego lub szablonu fallback.',
+          createdAt: now.toISOString(),
+        });
+      }
+    }
+
+    const effectiveAiCaller =
+      options.aiCaller !== undefined
+        ? options.aiCaller
+        : createDefaultGenAiCaller(workspaceApiKey);
 
     if (!settings.enabled && !options.bypassWindowAndDelay) {
       return {
@@ -221,7 +244,7 @@ export async function executeWarmupCycle(options: ExecuteWarmupOptions): Promise
       const generated = await generateInitialWarmupEmail({
         model: settings.aiModel,
         format: settings.messageFormat,
-        caller: options.aiCaller,
+        caller: effectiveAiCaller,
         rng: options.rng,
       });
 
@@ -233,7 +256,7 @@ export async function executeWarmupCycle(options: ExecuteWarmupOptions): Promise
           allowedEmails,
           level: 'warn',
           category: 'ai',
-          message: sanitizeForLogs(generated.fallbackReason ?? 'Użyto szablonu fallback dla wiadomości wychodzącej.'),
+          message: sanitizeForLogs(generated.fallbackReason ?? 'Użyto szablonu fallback dla wiadomości wychodzącej.', [workspaceApiKey || '']),
           createdAt: new Date().toISOString(),
         });
       }
@@ -303,7 +326,7 @@ export async function executeWarmupCycle(options: ExecuteWarmupOptions): Promise
       } catch (sendErr) {
         const cleanErr = sanitizeForLogs(
           sendErr instanceof Error ? sendErr.message : String(sendErr),
-          [primaryPassword]
+          [primaryPassword, workspaceApiKey || '']
         );
         errors.push(`Wysyłka SMTP: ${cleanErr}`);
         todayStats.errorCount += 1;
@@ -369,7 +392,7 @@ export async function executeWarmupCycle(options: ExecuteWarmupOptions): Promise
             allowedEmails,
             level: 'warn',
             category: 'imap',
-            message: sanitizeForLogs(warnMsg, [helperPassword]),
+            message: sanitizeForLogs(warnMsg, [helperPassword, workspaceApiKey || '']),
             createdAt: new Date().toISOString(),
           });
         }
@@ -418,7 +441,7 @@ export async function executeWarmupCycle(options: ExecuteWarmupOptions): Promise
             format: settings.messageFormat,
             originalSubject: match.thread.subject,
             originalSnippet: match.parsedSnippet,
-            caller: options.aiCaller,
+            caller: effectiveAiCaller,
             rng: options.rng,
           });
 
@@ -429,7 +452,7 @@ export async function executeWarmupCycle(options: ExecuteWarmupOptions): Promise
               allowedEmails,
               level: 'warn',
               category: 'ai',
-              message: sanitizeForLogs(replyGen.fallbackReason ?? 'Użyto szablonu fallback dla odpowiedzi.'),
+              message: sanitizeForLogs(replyGen.fallbackReason ?? 'Użyto szablonu fallback dla odpowiedzi.', [workspaceApiKey || '']),
               createdAt: new Date().toISOString(),
             });
           }
@@ -473,7 +496,7 @@ export async function executeWarmupCycle(options: ExecuteWarmupOptions): Promise
       } catch (helperErr) {
         const cleanErr = sanitizeForLogs(
           helperErr instanceof Error ? helperErr.message : String(helperErr),
-          [helperPassword]
+          [helperPassword, workspaceApiKey || '']
         );
         errors.push(`IMAP/odpowiedź (${helper.email}): ${cleanErr}`);
         todayStats.errorCount += 1;

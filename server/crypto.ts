@@ -149,6 +149,7 @@ export function sanitizeForLogs(message: string, secretsToRedact: string[] = [])
     .replace(/Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi, 'Bearer [REDACTED]')
     .replace(/(password|pass|passwd|secret|token|apikey|api_key)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
     .replace(/v1:[0-9a-f]{24}:[0-9a-f]{32}:[0-9a-f]+/gi, '[ENCRYPTED_SECRET]')
+    .replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_GEMINI_KEY]')
     .replace(/\s+/g, ' ')
     .trim();
 

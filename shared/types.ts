@@ -27,6 +27,9 @@ export interface WarmupSettings {
   timezone: string;
   messageFormat: MessageFormat;
   aiModel: string;
+  geminiApiKey?: string;
+  encryptedGeminiApiKey?: string;
+  hasCustomAiKey?: boolean;
   lastSentAt?: string;
   nextAllowedSendAt?: string;
   lastHelperIndex: number;
@@ -137,6 +140,7 @@ export interface SecretsStatus {
   hasCronSecret: boolean;
   cronSecretSource?: 'env' | 'auto' | 'missing';
   hasGeminiKey: boolean;
+  geminiKeySource?: 'workspace' | 'env' | 'missing';
 }
 
 export interface SessionResponse {
